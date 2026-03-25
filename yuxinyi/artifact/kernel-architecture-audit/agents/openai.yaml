@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kernel Architecture Audit"
+  short_description: "Audit kernel patches for cross-layer hacks."
+  default_prompt: "Use $kernel-architecture-audit to review this patch for abstraction-layer violations, Linux-paradigm drift, and hacky filesystem special-casing."

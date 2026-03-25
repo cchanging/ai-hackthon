@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ext2 Test Writer"
+  short_description: "Write ext2 semantic tests from specs"
+  default_prompt: "Use $ext2-test-writer to turn this Ext2 spec into concrete Asterinas unit tests and integration tests."

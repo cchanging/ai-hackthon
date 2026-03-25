@@ -1,0 +1,4 @@
+interface:
+  display_name: "Xfstests Failure Analysis"
+  short_description: "Diagnose xfstests failures for repair"
+  default_prompt: "Use $xfstests-failure-analysis to analyze the failing xfstests case for Asterinas Ext2 and produce a diagnosis plus repair guidance."

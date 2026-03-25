@@ -1,0 +1,5 @@
+interface:
+  display_name: Xfstests Fix
+  short_description: Diagnose and repair one xfstests failure round under active Trellis constraints.
+  icon: wrench
+  color: blue

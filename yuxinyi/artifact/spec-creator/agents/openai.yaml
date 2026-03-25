@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spec Creator"
+  short_description: "Create agent-friendly implementation specs"
+  default_prompt: "Use $spec-creator to draft an agent-friendly Asterinas implementation spec."

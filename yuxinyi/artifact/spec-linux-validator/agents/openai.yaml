@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spec Linux Validator"
+  short_description: "Validate spec and linux semantics"
+  default_prompt: "Use $spec-linux-validator to validate code against a spec and referenced Linux semantics."
