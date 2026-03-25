@@ -1,0 +1,9 @@
+[[irq_entries]]
+function = "register_configured_irq_entry"
+context = "HardIrqTopHalf"
+callback_arg_index = 0
+
+[[irq_entries]]
+function = "register_configured_softirq_entry"
+context = "BottomHalfL1"
+callback_arg_index = 0
