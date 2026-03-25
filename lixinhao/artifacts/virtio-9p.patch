@@ -1,0 +1,3143 @@
+commit 3a4e08e7c2f23e5a2c0b89a8198a1cb2e5739dda
+Author: li041 <lxh050013@outlook.com>
+Date:   Tue Mar 24 15:20:49 2026 +0800
+
+    ENABLE_9P=1 VIRTIO9P_SHARED_DIR=/tmp/9p_shared make run_kernel
+    mkdir -p /mnt/shared_dir
+    mount -t 9p -o trans=virtio my9p /mnt/shared_dir
+
+diff --git a/Makefile b/Makefile
+index f353a62af..5b6688f9b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -37,6 +37,10 @@ CONSOLE ?= hvc0
+ ROOTFS ?= ramfs
+ VIRTIOFS_TAG ?= myfs
+ VIRTIOFS_SHARED_DIR ?= /tmp/shared_dir
++# 9P shared directory (for virtio-9p transport)
++VIRTIO9P_TAG ?= my9p
++VIRTIO9P_SHARED_DIR ?= /tmp/9p_shared
++ENABLE_9P ?= 0
+ # End of global build options.
+ 
+ # GDB debugging and profiling options.
+diff --git a/kernel/comps/virtio/src/device/mod.rs b/kernel/comps/virtio/src/device/mod.rs
+index e0ac2b3ad..4679983b5 100644
+--- a/kernel/comps/virtio/src/device/mod.rs
++++ b/kernel/comps/virtio/src/device/mod.rs
+@@ -10,6 +10,7 @@ pub mod filesystem;
+ pub mod input;
+ pub mod network;
+ pub mod socket;
++pub mod transport9p;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, TryFromInt)]
+ #[repr(u8)]
+diff --git a/kernel/comps/virtio/src/device/transport9p/config.rs b/kernel/comps/virtio/src/device/transport9p/config.rs
+new file mode 100644
+index 000000000..5033ff8ef
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/transport9p/config.rs
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use core::mem::offset_of;
++
++use aster_util::safe_ptr::SafePtr;
++use ostd_pod::FromZeros;
++
++use crate::transport::{ConfigManager, VirtioTransport};
++
++bitflags::bitflags! {
++    pub struct Transport9PFeatures: u64 {
++        const MOUNT_TAG = 1 << 0;
++    }
++}
++
++impl Transport9PFeatures {
++    pub fn supported_features() -> Self {
++        Self::MOUNT_TAG
++    }
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct Virtio9PConfig {
++    pub tag_len: u16,
++    pub tag: [u8; 36],
++}
++
++impl Virtio9PConfig {
++    pub(super) fn new_manager(transport: &dyn VirtioTransport) -> ConfigManager<Self> {
++        let safe_ptr = transport
++            .device_config_mem()
++            .map(|mem| SafePtr::new(mem, 0));
++        let bar_space = transport.device_config_bar();
++
++        ConfigManager::new(safe_ptr, bar_space)
++    }
++}
++
++impl ConfigManager<Virtio9PConfig> {
++    pub(super) fn read_config(&self) -> Virtio9PConfig {
++        let mut config = Virtio9PConfig::new_zeroed();
++
++        config.tag_len = self
++            .read_once::<u16>(offset_of!(Virtio9PConfig, tag_len))
++            .unwrap();
++
++        let len = (config.tag_len as usize).min(config.tag.len());
++        for index in 0..len {
++            config.tag[index] = self
++                .read_once::<u8>(offset_of!(Virtio9PConfig, tag) + index)
++                .unwrap();
++        }
++
++        config
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/transport9p/device/client.rs b/kernel/comps/virtio/src/device/transport9p/device/client.rs
+new file mode 100644
+index 000000000..17863d416
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/transport9p/device/client.rs
+@@ -0,0 +1,535 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! 9P2000.L protocol client operations.
++
++use super::*;
++
++/// Directory entry returned by p9_readdir.
++#[derive(Debug, Clone)]
++pub struct P9DirEntryResult {
++    pub qid: P9Qid,
++    pub offset: u64,
++    pub type_: u8,
++    pub name: String,
++}
++
++impl Transport9PDevice {
++    /// Tversion/Rversion — negotiate protocol version and msize.
++    pub(crate) fn p9_version(&self) -> Result<(), VirtioDeviceError> {
++        let msize = DEFAULT_MSIZE;
++        let mut body = Vec::new();
++        body.extend_from_slice(&msize.to_le_bytes());
++        encode_string(&mut body, P9_PROTO_VERSION);
++
++        let request = build_message(P9_TVERSION, P9_NOTAG, &body);
++        let response = self.send_9p_request_early(&request, msize as usize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RVERSION)?;
++
++        if resp_body.len() < 4 {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++        let server_msize = read_u32_le(resp_body, 0);
++        let negotiated_msize = cmp::min(msize, server_msize);
++        self.msize.store(negotiated_msize, Ordering::Relaxed);
++
++        let (version, _) = decode_string(&resp_body[4..])
++            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++
++        info!(
++            "{} version negotiated: version={}, msize={}",
++            DEVICE_NAME, version, negotiated_msize
++        );
++
++        Ok(())
++    }
++
++    /// Tattach/Rattach — attach to the filesystem root.
++    /// Returns (qid of root).
++    pub fn p9_attach(
++        &self,
++        fid: u32,
++        afid: u32,
++        uname: &str,
++        aname: &str,
++        n_uname: u32,
++    ) -> Result<P9Qid, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        body.extend_from_slice(&afid.to_le_bytes());
++        encode_string(&mut body, uname);
++        encode_string(&mut body, aname);
++        body.extend_from_slice(&n_uname.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TATTACH, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RATTACH)?;
++
++        let (qid, _) = P9Qid::decode(resp_body)
++            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++
++        Ok(qid)
++    }
++
++    /// Twalk/Rwalk — walk to a new path from fid, returning (newfid, list of qids).
++    pub fn p9_walk(
++        &self,
++        fid: u32,
++        newfid: u32,
++        names: &[&str],
++    ) -> Result<Vec<P9Qid>, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        body.extend_from_slice(&newfid.to_le_bytes());
++        let nwname = names.len() as u16;
++        body.extend_from_slice(&nwname.to_le_bytes());
++        for name in names {
++            encode_string(&mut body, name);
++        }
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TWALK, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RWALK)?;
++
++        if resp_body.len() < 2 {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++        let nwqid = read_u16_le(resp_body, 0) as usize;
++        let mut qids = Vec::with_capacity(nwqid);
++        let mut pos = 2;
++        for _ in 0..nwqid {
++            let (qid, consumed) = P9Qid::decode(&resp_body[pos..])
++                .ok_or(VirtioDeviceError::QueueUnknownError)?;
++            qids.push(qid);
++            pos += consumed;
++        }
++
++        Ok(qids)
++    }
++
++    /// Tlopen/Rlopen — open a file by fid, returning (qid, iounit).
++    pub fn p9_lopen(
++        &self,
++        fid: u32,
++        flags: u32,
++    ) -> Result<(P9Qid, u32), VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        body.extend_from_slice(&flags.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TLOPEN, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RLOPEN)?;
++
++        if resp_body.len() < 17 {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++        let (qid, _) = P9Qid::decode(resp_body)
++            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let iounit = read_u32_le(resp_body, 13);
++
++        Ok((qid, iounit))
++    }
++
++    /// Tlcreate/Rlcreate — create a file, returning (qid, iounit).
++    pub fn p9_lcreate(
++        &self,
++        fid: u32,
++        name: &str,
++        flags: u32,
++        mode: u32,
++        gid: u32,
++    ) -> Result<(P9Qid, u32), VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        encode_string(&mut body, name);
++        body.extend_from_slice(&flags.to_le_bytes());
++        body.extend_from_slice(&mode.to_le_bytes());
++        body.extend_from_slice(&gid.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TLCREATE, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RLCREATE)?;
++
++        if resp_body.len() < 17 {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++        let (qid, _) = P9Qid::decode(resp_body)
++            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let iounit = read_u32_le(resp_body, 13);
++
++        Ok((qid, iounit))
++    }
++
++    /// Tgetattr/Rgetattr.
++    pub fn p9_getattr(
++        &self,
++        fid: u32,
++        request_mask: u64,
++    ) -> Result<P9Attr, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        body.extend_from_slice(&request_mask.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TGETATTR, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RGETATTR)?;
++
++        let (attr, _) = P9Attr::decode(resp_body)
++            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++
++        Ok(attr)
++    }
++
++    /// Tsetattr/Rsetattr.
++    pub fn p9_setattr(
++        &self,
++        fid: u32,
++        valid: u32,
++        mode: u32,
++        uid: u32,
++        gid: u32,
++        size: u64,
++        atime_sec: u64,
++        atime_nsec: u64,
++        mtime_sec: u64,
++        mtime_nsec: u64,
++    ) -> Result<(), VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        body.extend_from_slice(&valid.to_le_bytes());
++        body.extend_from_slice(&mode.to_le_bytes());
++        body.extend_from_slice(&uid.to_le_bytes());
++        body.extend_from_slice(&gid.to_le_bytes());
++        body.extend_from_slice(&size.to_le_bytes());
++        body.extend_from_slice(&atime_sec.to_le_bytes());
++        body.extend_from_slice(&atime_nsec.to_le_bytes());
++        body.extend_from_slice(&mtime_sec.to_le_bytes());
++        body.extend_from_slice(&mtime_nsec.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TSETATTR, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let _ = Self::check_9p_response(&response, P9_RSETATTR)?;
++
++        Ok(())
++    }
++
++    /// Tread/Rread — read data from an open fid.
++    pub fn p9_read(
++        &self,
++        fid: u32,
++        offset: u64,
++        count: u32,
++    ) -> Result<Vec<u8>, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        body.extend_from_slice(&offset.to_le_bytes());
++        body.extend_from_slice(&count.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TREAD, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RREAD)?;
++
++        if resp_body.len() < 4 {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++        let data_len = read_u32_le(resp_body, 0) as usize;
++        if resp_body.len() < 4 + data_len {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++
++        Ok(resp_body[4..4 + data_len].to_vec())
++    }
++
++    /// Twrite/Rwrite — write data to an open fid, returns bytes written.
++    pub fn p9_write(
++        &self,
++        fid: u32,
++        offset: u64,
++        data: &[u8],
++    ) -> Result<u32, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        body.extend_from_slice(&offset.to_le_bytes());
++        let count = data.len() as u32;
++        body.extend_from_slice(&count.to_le_bytes());
++        body.extend_from_slice(data);
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TWRITE, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RWRITE)?;
++
++        if resp_body.len() < 4 {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++        let written = read_u32_le(resp_body, 0);
++
++        Ok(written)
++    }
++
++    /// Tclunk/Rclunk — release a fid.
++    pub fn p9_clunk(&self, fid: u32) -> Result<(), VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TCLUNK, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let _ = Self::check_9p_response(&response, P9_RCLUNK)?;
++
++        Ok(())
++    }
++
++    /// Treaddir/Rreaddir — read directory entries from an open directory fid.
++    pub fn p9_readdir(
++        &self,
++        fid: u32,
++        offset: u64,
++        count: u32,
++    ) -> Result<Vec<P9DirEntry>, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        body.extend_from_slice(&offset.to_le_bytes());
++        body.extend_from_slice(&count.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TREADDIR, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RREADDIR)?;
++
++        if resp_body.len() < 4 {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++        let data_len = read_u32_le(resp_body, 0) as usize;
++        if resp_body.len() < 4 + data_len {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++
++        let entries = parse_readdir_entries(&resp_body[4..4 + data_len]);
++        Ok(entries)
++    }
++
++    /// Tmkdir/Rmkdir — create a directory, returns qid.
++    pub fn p9_mkdir(
++        &self,
++        dfid: u32,
++        name: &str,
++        mode: u32,
++        gid: u32,
++    ) -> Result<P9Qid, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&dfid.to_le_bytes());
++        encode_string(&mut body, name);
++        body.extend_from_slice(&mode.to_le_bytes());
++        body.extend_from_slice(&gid.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TMKDIR, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RMKDIR)?;
++
++        let (qid, _) = P9Qid::decode(resp_body)
++            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++
++        Ok(qid)
++    }
++
++    /// Tunlinkat/Runlinkat — remove a directory entry.
++    pub fn p9_unlinkat(
++        &self,
++        dirfid: u32,
++        name: &str,
++        flags: u32,
++    ) -> Result<(), VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&dirfid.to_le_bytes());
++        encode_string(&mut body, name);
++        body.extend_from_slice(&flags.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TUNLINKAT, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let _ = Self::check_9p_response(&response, P9_RUNLINKAT)?;
++
++        Ok(())
++    }
++
++    /// Trenameat/Rrenameat — rename a directory entry.
++    pub fn p9_renameat(
++        &self,
++        olddirfid: u32,
++        oldname: &str,
++        newdirfid: u32,
++        newname: &str,
++    ) -> Result<(), VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&olddirfid.to_le_bytes());
++        encode_string(&mut body, oldname);
++        body.extend_from_slice(&newdirfid.to_le_bytes());
++        encode_string(&mut body, newname);
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TRENAMEAT, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let _ = Self::check_9p_response(&response, P9_RRENAMEAT)?;
++
++        Ok(())
++    }
++
++    /// Tlink/Rlink — create a hard link.
++    pub fn p9_link(
++        &self,
++        dfid: u32,
++        fid: u32,
++        name: &str,
++    ) -> Result<(), VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&dfid.to_le_bytes());
++        body.extend_from_slice(&fid.to_le_bytes());
++        encode_string(&mut body, name);
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TLINK, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let _ = Self::check_9p_response(&response, P9_RLINK)?;
++
++        Ok(())
++    }
++
++    /// Tsymlink/Rsymlink — create a symbolic link.
++    pub fn p9_symlink(
++        &self,
++        dfid: u32,
++        name: &str,
++        symtgt: &str,
++        gid: u32,
++    ) -> Result<P9Qid, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&dfid.to_le_bytes());
++        encode_string(&mut body, name);
++        encode_string(&mut body, symtgt);
++        body.extend_from_slice(&gid.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TSYMLINK, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RSYMLINK)?;
++
++        let (qid, _) = P9Qid::decode(resp_body)
++            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++
++        Ok(qid)
++    }
++
++    /// Treadlink/Rreadlink — read a symbolic link target.
++    pub fn p9_readlink(&self, fid: u32) -> Result<String, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TREADLINK, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RREADLINK)?;
++
++        let (target, _) = decode_string(resp_body)
++            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++
++        Ok(target)
++    }
++
++    /// Tmknod/Rmknod — create a special file.
++    pub fn p9_mknod(
++        &self,
++        dfid: u32,
++        name: &str,
++        mode: u32,
++        major: u32,
++        minor: u32,
++        gid: u32,
++    ) -> Result<P9Qid, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&dfid.to_le_bytes());
++        encode_string(&mut body, name);
++        body.extend_from_slice(&mode.to_le_bytes());
++        body.extend_from_slice(&major.to_le_bytes());
++        body.extend_from_slice(&minor.to_le_bytes());
++        body.extend_from_slice(&gid.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TMKNOD, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RMKNOD)?;
++
++        let (qid, _) = P9Qid::decode(resp_body)
++            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++
++        Ok(qid)
++    }
++
++    /// Tstatfs/Rstatfs — get filesystem statistics.
++    pub fn p9_statfs(&self, fid: u32) -> Result<P9StatFs, VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TSTATFS, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let resp_body = Self::check_9p_response(&response, P9_RSTATFS)?;
++
++        P9StatFs::decode(resp_body).ok_or(VirtioDeviceError::QueueUnknownError)
++    }
++
++    /// Tfsync/Rfsync — sync a file to disk.
++    pub fn p9_fsync(&self, fid: u32, datasync: u32) -> Result<(), VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&fid.to_le_bytes());
++        body.extend_from_slice(&datasync.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TFSYNC, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let _ = Self::check_9p_response(&response, P9_RFSYNC)?;
++
++        Ok(())
++    }
++
++    /// Tflush/Rflush — flush a pending request.
++    pub fn p9_flush(&self, oldtag: u16) -> Result<(), VirtioDeviceError> {
++        let mut body = Vec::new();
++        body.extend_from_slice(&oldtag.to_le_bytes());
++
++        let tag = self.alloc_tag_id();
++        let request = build_message(P9_TFLUSH, tag, &body);
++        let msize = self.msize() as usize;
++        let response = self.send_9p_request(&request, msize)?;
++        let _ = Self::check_9p_response(&response, P9_RFLUSH)?;
++
++        Ok(())
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/transport9p/device/helpers.rs b/kernel/comps/virtio/src/device/transport9p/device/helpers.rs
+new file mode 100644
+index 000000000..d7649c169
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/transport9p/device/helpers.rs
+@@ -0,0 +1,129 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use alloc::vec;
++
++use super::*;
++
++impl Transport9PDevice {
++    pub(super) fn parse_tag(raw_tag: &[u8; 36], tag_len: u16) -> String {
++        let len = (tag_len as usize).min(raw_tag.len());
++        let end = raw_tag[..len]
++            .iter()
++            .position(|&byte| byte == 0)
++            .unwrap_or(len);
++
++        match core::str::from_utf8(&raw_tag[..end]) {
++            Ok(tag) => tag.to_string(),
++            Err(_) => "<invalid-tag>".to_string(),
++        }
++    }
++
++    pub(super) fn alloc_tag_id(&self) -> u16 {
++        (self.tag_alloc.alloc() as u16) & 0x7FFF
++    }
++
++    pub(super) fn alloc_unique(&self) -> u64 {
++        self.tag_alloc.alloc() as u64
++    }
++
++    fn alloc_to_device_buf(&self, size: usize) -> P9DmaBuf {
++        self.dma_pools.alloc_to_device(size)
++    }
++
++    fn alloc_from_device_buf(&self, size: usize) -> P9DmaBuf {
++        self.dma_pools.alloc_from_device(size)
++    }
++
++    /// Prepare a to-device buffer containing raw bytes.
++    pub(super) fn prepare_request_buf(&self, data: &[u8]) -> Slice<P9DmaBuf> {
++        let buf = self.alloc_to_device_buf(data.len());
++        let slice = Slice::new(buf.clone(), 0..data.len());
++        {
++            let mut writer = buf.writer().unwrap();
++            let mut reader = VmReader::from(data);
++            let _ = writer.write(&mut reader);
++        }
++        slice
++            .mem_obj()
++            .sync_to_device(slice.offset().clone())
++            .unwrap();
++        slice
++    }
++
++    /// Prepare a from-device buffer of given size for response.
++    pub(super) fn prepare_response_buf(&self, size: usize) -> Slice<P9DmaBuf> {
++        let buf = self.alloc_from_device_buf(size);
++        Slice::new(buf.clone(), 0..size)
++    }
++
++    /// Read the response bytes from a from-device slice.
++    pub(super) fn read_response_bytes(&self, slice: &Slice<P9DmaBuf>) -> Vec<u8> {
++        slice
++            .mem_obj()
++            .sync_from_device(slice.offset().clone())
++            .unwrap();
++
++        let mut data = vec![0u8; slice.size()];
++        let mut reader = slice.reader().unwrap();
++        reader.read(&mut VmWriter::from(data.as_mut_slice()));
++        data
++    }
++
++    /// Send a 9P request and wait for response. Returns the raw response bytes.
++    pub(super) fn send_9p_request(
++        &self,
++        request_data: &[u8],
++        max_response_size: usize,
++    ) -> Result<Vec<u8>, VirtioDeviceError> {
++        let unique = self.alloc_unique();
++
++        let req_slice = self.prepare_request_buf(request_data);
++        let resp_slice = self.prepare_response_buf(max_response_size);
++
++        self.submit_request_and_wait(unique, &[&req_slice], &[&resp_slice])?;
++
++        let response = self.read_response_bytes(&resp_slice);
++        Ok(response)
++    }
++
++    /// Send a 9P request during early boot (spin-wait).
++    pub(super) fn send_9p_request_early(
++        &self,
++        request_data: &[u8],
++        max_response_size: usize,
++    ) -> Result<Vec<u8>, VirtioDeviceError> {
++        let unique = self.alloc_unique();
++
++        let req_slice = self.prepare_request_buf(request_data);
++        let resp_slice = self.prepare_response_buf(max_response_size);
++
++        self.submit_request(unique, &[&req_slice], &[&resp_slice])?;
++        self.wait_for_unique_early(unique as usize)?;
++
++        let response = self.read_response_bytes(&resp_slice);
++        Ok(response)
++    }
++
++    /// Check a 9P response for errors. Returns the body (after header).
++    pub(super) fn check_9p_response(
++        response: &[u8],
++        expected_type: u8,
++    ) -> Result<&[u8], VirtioDeviceError> {
++        if let Some(errno) = check_rlerror(response) {
++            return Err(VirtioDeviceError::FileSystemError(-(errno as i32)));
++        }
++
++        let (_size, msg_type, _tag) =
++            parse_header(response).ok_or(VirtioDeviceError::QueueUnknownError)?;
++
++        if msg_type != expected_type {
++            warn!(
++                "9P unexpected response type: got {}, expected {}",
++                msg_type, expected_type
++            );
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++
++        Ok(&response[P9_HEADER_SIZE..])
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/transport9p/device/mod.rs b/kernel/comps/virtio/src/device/transport9p/device/mod.rs
+new file mode 100644
+index 000000000..244b59309
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/transport9p/device/mod.rs
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use alloc::{
++    boxed::Box,
++    collections::BTreeMap,
++    string::{String, ToString},
++    sync::Arc,
++    vec::Vec,
++};
++use core::{
++    cmp,
++    hint::spin_loop,
++    sync::atomic::{AtomicU32, Ordering},
++};
++
++use aster_util::mem_obj_slice::Slice;
++use log::{debug, info, warn};
++use ostd::{
++    arch::trap::TrapFrame,
++    mm::{HasSize, VmReader, VmWriter, io_util::HasVmReaderWriter},
++    sync::{LocalIrqDisabled, SpinLock, Waiter, Waker},
++    timer::{Jiffies, TIMER_FREQ},
++};
++use spin::Once;
++
++use super::{
++    DEVICE_NAME,
++    config::{Transport9PFeatures, Virtio9PConfig},
++    pool::{P9DmaBuf, P9DmaPools},
++    protocol::*,
++};
++use crate::{
++    device::VirtioDeviceError,
++    id_alloc::SyncIdAlloc,
++    queue::{QueueError, VirtQueue},
++    transport::{VirtioTransport, VirtioTransportError},
++};
++
++const REQUEST_QUEUE_INDEX: u16 = 0;
++const DEFAULT_QUEUE_SIZE: u16 = 128;
++const TAG_ALLOC_CAPACITY: usize = 4096;
++const REQUEST_WAIT_TIMEOUT_JIFFIES: u64 = 10 * TIMER_FREQ;
++
++static TRANSPORT9P_DEVICES: Once<SpinLock<Vec<Arc<Transport9PDevice>>>> = Once::new();
++
++struct RequestWaitState {
++    completed: bool,
++    waker: Option<Arc<Waker>>,
++}
++
++struct P9RequestQueue {
++    queue: SpinLock<VirtQueue, LocalIrqDisabled>,
++    pending_requests: SpinLock<BTreeMap<u16, usize>>,
++    request_states: SpinLock<BTreeMap<usize, RequestWaitState>>,
++}
++
++impl P9RequestQueue {
++    fn new(queue: VirtQueue) -> Self {
++        Self {
++            queue: SpinLock::new(queue),
++            pending_requests: SpinLock::new(BTreeMap::new()),
++            request_states: SpinLock::new(BTreeMap::new()),
++        }
++    }
++}
++
++impl core::fmt::Debug for P9RequestQueue {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("P9RequestQueue")
++            .field("queue", &self.queue)
++            .field(
++                "pending_requests_len",
++                &self.pending_requests.disable_irq().lock().len(),
++            )
++            .finish()
++    }
++}
++
++pub struct Transport9PDevice {
++    transport: SpinLock<Box<dyn VirtioTransport>, LocalIrqDisabled>,
++    request_queue: P9RequestQueue,
++    dma_pools: Arc<P9DmaPools>,
++    tag_alloc: SyncIdAlloc,
++    tag: String,
++    msize: AtomicU32,
++}
++
++impl core::fmt::Debug for Transport9PDevice {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("Transport9PDevice")
++            .field("transport", &self.transport)
++            .field("tag", &self.tag)
++            .field("msize", &self.msize.load(Ordering::Relaxed))
++            .finish()
++    }
++}
++
++mod client;
++mod helpers;
++mod virtio_ops;
++
++pub fn get_device_by_tag(tag: &str) -> Option<Arc<Transport9PDevice>> {
++    let devices = TRANSPORT9P_DEVICES.get()?;
++    let devices = devices.disable_irq().lock();
++    devices.iter().find(|device| device.tag == tag).cloned()
++}
++
++fn config_space_change(_: &TrapFrame) {
++    debug!("Virtio-9P device configuration space change");
++}
++
++fn map_transport_err(_: VirtioTransportError) -> VirtioDeviceError {
++    VirtioDeviceError::QueueUnknownError
++}
++
++impl Transport9PDevice {
++    pub fn tag(&self) -> &str {
++        &self.tag
++    }
++
++    pub fn msize(&self) -> u32 {
++        self.msize.load(Ordering::Relaxed)
++    }
++
++    pub(super) fn submit_request(
++        &self,
++        unique: u64,
++        in_slices: &[&Slice<P9DmaBuf>],
++        out_slices: &[&Slice<P9DmaBuf>],
++    ) -> Result<(), VirtioDeviceError> {
++        let queue = &self.request_queue;
++
++        {
++            let mut virt_queue = queue.queue.lock();
++
++            let token = virt_queue.add_dma_buf(in_slices, out_slices)?;
++
++            queue
++                .pending_requests
++                .disable_irq()
++                .lock()
++                .insert(token, unique as usize);
++
++            if virt_queue.should_notify() {
++                virt_queue.notify();
++            }
++        }
++        Ok(())
++    }
++
++    pub(super) fn submit_request_and_wait(
++        &self,
++        unique: u64,
++        in_slices: &[&Slice<P9DmaBuf>],
++        out_slices: &[&Slice<P9DmaBuf>],
++    ) -> Result<(), VirtioDeviceError> {
++        self.submit_request(unique, in_slices, out_slices)?;
++        self.wait_for_unique(unique as usize)
++    }
++
++    pub(super) fn handle_queue_irq(&self) {
++        let queue_state = &self.request_queue;
++        loop {
++            let pop_result = {
++                let mut queue = queue_state.queue.lock();
++                queue.pop_used()
++            };
++
++            let (token, _) = match pop_result {
++                Ok(completed) => completed,
++                Err(QueueError::NotReady) => break,
++                Err(_) => break,
++            };
++
++            let pending = queue_state
++                .pending_requests
++                .disable_irq()
++                .lock()
++                .remove(&token);
++
++            let Some(pending) = pending else {
++                continue;
++            };
++
++            let mut request_states = queue_state.request_states.disable_irq().lock();
++            let request_state = request_states.entry(pending).or_insert(RequestWaitState {
++                completed: false,
++                waker: None,
++            });
++            request_state.completed = true;
++
++            if let Some(waker) = request_state.waker.take() {
++                let _ = waker.wake_up();
++            }
++        }
++    }
++
++    pub(super) fn wait_for_unique(
++        &self,
++        unique: usize,
++    ) -> Result<(), VirtioDeviceError> {
++        let queue_state = &self.request_queue;
++
++        {
++            let mut request_states = queue_state.request_states.disable_irq().lock();
++            if let Some(state) = request_states.get(&unique)
++                && state.completed
++            {
++                request_states.remove(&unique);
++                self.tag_alloc.dealloc(unique);
++                return Ok(());
++            }
++        }
++
++        let (waiter, waker) = Waiter::new_pair();
++        {
++            let mut request_states = queue_state.request_states.disable_irq().lock();
++            let state = request_states.entry(unique).or_insert(RequestWaitState {
++                completed: false,
++                waker: None,
++            });
++            if state.completed {
++                request_states.remove(&unique);
++                self.tag_alloc.dealloc(unique);
++                return Ok(());
++            }
++            state.waker = Some(waker);
++        }
++
++        let timeout_deadline = Jiffies::elapsed()
++            .as_u64()
++            .saturating_add(REQUEST_WAIT_TIMEOUT_JIFFIES);
++
++        let wait_res = waiter.wait_until_or_cancelled(
++            || {
++                let mut request_states = queue_state.request_states.disable_irq().lock();
++                if let Some(state) = request_states.get(&unique)
++                    && state.completed
++                {
++                    request_states.remove(&unique);
++                    return Some(());
++                }
++                None
++            },
++            || {
++                if Jiffies::elapsed().as_u64() >= timeout_deadline {
++                    Err(())
++                } else {
++                    Ok(())
++                }
++            },
++        );
++
++        if wait_res.is_ok() {
++            self.tag_alloc.dealloc(unique);
++            return Ok(());
++        }
++
++        let mut request_states = queue_state.request_states.disable_irq().lock();
++        if let Some(state) = request_states.get_mut(&unique) {
++            state.waker = None;
++        }
++        request_states.remove(&unique);
++        self.tag_alloc.dealloc(unique);
++
++        Err(VirtioDeviceError::QueueUnknownError)
++    }
++
++    /// Wait for a reply from the device by spinning;
++    /// intended for early boot or non-task contexts.
++    pub(super) fn wait_for_unique_early(
++        &self,
++        unique: usize,
++    ) -> Result<(), VirtioDeviceError> {
++        let queue_state = &self.request_queue;
++
++        loop {
++            self.handle_queue_irq();
++
++            let mut request_states = queue_state.request_states.disable_irq().lock();
++            if let Some(state) = request_states.get(&unique)
++                && state.completed
++            {
++                request_states.remove(&unique);
++                self.tag_alloc.dealloc(unique);
++                return Ok(());
++            }
++
++            spin_loop();
++        }
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/transport9p/device/virtio_ops.rs b/kernel/comps/virtio/src/device/transport9p/device/virtio_ops.rs
+new file mode 100644
+index 000000000..05933fb04
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/transport9p/device/virtio_ops.rs
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use super::*;
++
++impl Transport9PDevice {
++    pub fn negotiate_features(features: u64) -> u64 {
++        let device_features = Transport9PFeatures::from_bits_truncate(features);
++        let supported_features = Transport9PFeatures::supported_features();
++        let fs_features = device_features & supported_features;
++        debug!("9P features negotiated: {:?}", fs_features);
++        fs_features.bits()
++    }
++
++    pub fn init(mut transport: Box<dyn VirtioTransport>) -> Result<(), VirtioDeviceError> {
++        let config_manager = Virtio9PConfig::new_manager(transport.as_ref());
++        let config = config_manager.read_config();
++
++        let total_queues = transport.num_queues();
++        if total_queues < 1 {
++            return Err(VirtioDeviceError::QueuesAmountDoNotMatch(total_queues, 1));
++        }
++
++        let request_queue =
++            P9RequestQueue::new(Self::new_queue(REQUEST_QUEUE_INDEX, transport.as_mut())?);
++
++        let dma_pools = P9DmaPools::new();
++
++        let tag = Self::parse_tag(&config.tag, config.tag_len);
++        let device = Arc::new(Self {
++            transport: SpinLock::new(transport),
++            request_queue,
++            dma_pools,
++            tag_alloc: SyncIdAlloc::with_capacity(TAG_ALLOC_CAPACITY),
++            tag,
++            msize: AtomicU32::new(DEFAULT_MSIZE),
++        });
++
++        let mut transport = device.transport.lock();
++        transport
++            .register_cfg_callback(Box::new(config_space_change))
++            .unwrap();
++
++        let device_for_callback = device.clone();
++        let wakeup_callback = move |_: &TrapFrame| {
++            device_for_callback.handle_queue_irq();
++        };
++        transport
++            .register_queue_callback(REQUEST_QUEUE_INDEX, Box::new(wakeup_callback), false)
++            .unwrap();
++
++        transport.finish_init();
++        drop(transport);
++
++        // Perform 9P version negotiation.
++        device.p9_version()?;
++
++        TRANSPORT9P_DEVICES
++            .call_once(|| SpinLock::new(Vec::new()))
++            .disable_irq()
++            .lock()
++            .push(device.clone());
++
++        info!(
++            "{} initialized, tag = {}, msize = {}",
++            DEVICE_NAME,
++            device.tag,
++            device.msize.load(Ordering::Relaxed),
++        );
++
++        Ok(())
++    }
++
++    fn new_queue(
++        index: u16,
++        transport: &mut dyn VirtioTransport,
++    ) -> Result<VirtQueue, VirtioDeviceError> {
++        let max_queue_size = transport.max_queue_size(index).map_err(map_transport_err)?;
++        let queue_size = cmp::min(DEFAULT_QUEUE_SIZE, max_queue_size);
++        if queue_size == 0 {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++        VirtQueue::new(index, queue_size, transport).map_err(Into::into)
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/transport9p/mod.rs b/kernel/comps/virtio/src/device/transport9p/mod.rs
+new file mode 100644
+index 000000000..91d164744
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/transport9p/mod.rs
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: MPL-2.0
++
++pub mod config;
++pub mod device;
++pub mod pool;
++pub mod protocol;
++
++pub const DEVICE_NAME: &str = "Virtio-9P";
+diff --git a/kernel/comps/virtio/src/device/transport9p/pool.rs b/kernel/comps/virtio/src/device/transport9p/pool.rs
+new file mode 100644
+index 000000000..f385eb4d6
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/transport9p/pool.rs
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! DMA buffer pool for 9P transport — adapted from filesystem/pool.rs.
++
++use alloc::{collections::BTreeMap, sync::Arc};
++use core::ops::Range;
++
++use aster_network::{DmaSegment, dma_pool::DmaPool};
++use aster_util::mem_obj_slice::Slice;
++use ostd::{
++    Result,
++    mm::{
++        HasDaddr, HasSize, Infallible, PAGE_SIZE, VmReader, VmWriter,
++        dma::{DmaStream, FromDevice, ToDevice},
++        io_util::{HasVmReaderWriter, VmReaderWriterResult},
++    },
++    sync::SpinLock,
++};
++
++use crate::dma_buf::DmaBuf;
++
++const SIZE_CLASSES: &[usize] = &[64, 128, 256, 512, 1024, 2048, 4096];
++const POOL_INIT_SIZE: usize = 8;
++const POOL_HIGH_WATERMARK: usize = 64;
++
++#[derive(Debug)]
++pub struct P9DmaPools {
++    to_device_pools: SpinLock<BTreeMap<usize, Arc<DmaPool<ToDevice>>>>,
++    from_device_pools: SpinLock<BTreeMap<usize, Arc<DmaPool<FromDevice>>>>,
++}
++
++impl P9DmaPools {
++    pub fn new() -> Arc<Self> {
++        let mut to_device_pools = BTreeMap::new();
++        let mut from_device_pools = BTreeMap::new();
++        for &class in SIZE_CLASSES {
++            to_device_pools.insert(
++                class,
++                DmaPool::<ToDevice>::new(class, POOL_INIT_SIZE, POOL_HIGH_WATERMARK, false),
++            );
++            from_device_pools.insert(
++                class,
++                DmaPool::<FromDevice>::new(class, POOL_INIT_SIZE, POOL_HIGH_WATERMARK, false),
++            );
++        }
++
++        Arc::new(Self {
++            to_device_pools: SpinLock::new(to_device_pools),
++            from_device_pools: SpinLock::new(from_device_pools),
++        })
++    }
++
++    pub fn alloc_to_device(self: &Arc<Self>, required_len: usize) -> P9DmaBuf {
++        let class = SIZE_CLASSES.iter().find(|&&size| size >= required_len);
++
++        let storage = if let Some(class_size) = class {
++            let pool = self
++                .to_device_pools
++                .disable_irq()
++                .lock()
++                .get(&class_size)
++                .unwrap()
++                .clone();
++            P9DmaStorage::ToSegment(pool.alloc_segment().unwrap())
++        } else {
++            P9DmaStorage::Stream(Arc::new(
++                DmaStream::alloc(required_len.div_ceil(PAGE_SIZE), false).unwrap(),
++            ))
++        };
++
++        P9DmaBuf {
++            storage: Arc::new(storage),
++            required_len,
++        }
++    }
++
++    pub fn alloc_from_device(self: &Arc<Self>, required_len: usize) -> P9DmaBuf {
++        let class = SIZE_CLASSES.iter().find(|&&size| size >= required_len);
++
++        let storage = if let Some(class_size) = class {
++            let pool = self
++                .from_device_pools
++                .disable_irq()
++                .lock()
++                .get(&class_size)
++                .unwrap()
++                .clone();
++            P9DmaStorage::FromSegment(pool.alloc_segment().unwrap())
++        } else {
++            P9DmaStorage::Stream(Arc::new(
++                DmaStream::alloc(required_len.div_ceil(PAGE_SIZE), false).unwrap(),
++            ))
++        };
++
++        P9DmaBuf {
++            storage: Arc::new(storage),
++            required_len,
++        }
++    }
++}
++
++#[derive(Debug)]
++enum P9DmaStorage {
++    ToSegment(DmaSegment<ToDevice>),
++    FromSegment(DmaSegment<FromDevice>),
++    Stream(Arc<DmaStream>),
++}
++
++#[derive(Debug, Clone)]
++pub struct P9DmaBuf {
++    storage: Arc<P9DmaStorage>,
++    required_len: usize,
++}
++
++impl P9DmaBuf {
++    pub fn sync_from_device(&self, byte_range: Range<usize>) -> Result<()> {
++        match self.storage.as_ref() {
++            P9DmaStorage::ToSegment(_) => Ok(()),
++            P9DmaStorage::FromSegment(segment) => segment.sync_from_device(byte_range),
++            P9DmaStorage::Stream(stream) => stream.sync_from_device(byte_range),
++        }
++    }
++
++    pub fn sync_to_device(&self, byte_range: Range<usize>) -> Result<()> {
++        match self.storage.as_ref() {
++            P9DmaStorage::ToSegment(segment) => segment.sync_to_device(byte_range),
++            P9DmaStorage::FromSegment(_) => Ok(()),
++            P9DmaStorage::Stream(stream) => stream.sync_to_device(byte_range),
++        }
++    }
++}
++
++impl HasSize for P9DmaBuf {
++    fn size(&self) -> usize {
++        self.required_len
++    }
++}
++
++impl HasDaddr for P9DmaBuf {
++    fn daddr(&self) -> ostd::mm::Daddr {
++        match self.storage.as_ref() {
++            P9DmaStorage::ToSegment(segment) => segment.daddr(),
++            P9DmaStorage::FromSegment(segment) => segment.daddr(),
++            P9DmaStorage::Stream(stream) => stream.daddr(),
++        }
++    }
++}
++
++impl HasVmReaderWriter for P9DmaBuf {
++    type Types = VmReaderWriterResult;
++
++    fn reader(&self) -> ostd::prelude::Result<VmReader<'_, Infallible>> {
++        let mut reader = match self.storage.as_ref() {
++            P9DmaStorage::ToSegment(segment) => segment.reader()?,
++            P9DmaStorage::FromSegment(segment) => segment.reader()?,
++            P9DmaStorage::Stream(stream) => stream.reader()?,
++        };
++        reader.limit(self.required_len);
++        Ok(reader)
++    }
++
++    fn writer(&self) -> ostd::prelude::Result<VmWriter<'_, Infallible>> {
++        let mut writer = match self.storage.as_ref() {
++            P9DmaStorage::ToSegment(segment) => segment.writer()?,
++            P9DmaStorage::FromSegment(segment) => segment.writer()?,
++            P9DmaStorage::Stream(stream) => stream.writer()?,
++        };
++        writer.limit(self.required_len);
++        Ok(writer)
++    }
++}
++
++impl DmaBuf for P9DmaBuf {
++    fn len(&self) -> usize {
++        self.size()
++    }
++}
++
++impl DmaBuf for Slice<P9DmaBuf> {
++    fn len(&self) -> usize {
++        self.size()
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/transport9p/protocol.rs b/kernel/comps/virtio/src/device/transport9p/protocol.rs
+new file mode 100644
+index 000000000..b640ccbc8
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/transport9p/protocol.rs
+@@ -0,0 +1,398 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! 9P2000.L protocol definitions.
++//!
++//! Reference: <https://github.com/chaos/diod/blob/master/protocol.md>
++
++use alloc::{
++    string::{String, ToString},
++    vec::Vec,
++};
++
++/// 9P protocol version string.
++pub const P9_PROTO_VERSION: &str = "9P2000.L";
++
++/// Special tag value meaning "no tag".
++pub const P9_NOTAG: u16 = 0xFFFF;
++
++/// Special FID value meaning "no fid".
++pub const P9_NOFID: u32 = 0xFFFFFFFF;
++
++/// Default maximum message size.
++pub const DEFAULT_MSIZE: u32 = 8192;
++
++/// Size of 9P message header (size[4] + type[1] + tag[2]).
++pub const P9_HEADER_SIZE: usize = 7;
++
++// 9P2000.L message types (T = request, R = response).
++pub const P9_TLERROR: u8 = 6;
++pub const P9_RLERROR: u8 = 7;
++pub const P9_TSTATFS: u8 = 8;
++pub const P9_RSTATFS: u8 = 9;
++pub const P9_TLOPEN: u8 = 12;
++pub const P9_RLOPEN: u8 = 13;
++pub const P9_TLCREATE: u8 = 14;
++pub const P9_RLCREATE: u8 = 15;
++pub const P9_TSYMLINK: u8 = 16;
++pub const P9_RSYMLINK: u8 = 17;
++pub const P9_TMKNOD: u8 = 18;
++pub const P9_RMKNOD: u8 = 19;
++pub const P9_TRENAME: u8 = 20;
++pub const P9_RRENAME: u8 = 21;
++pub const P9_TREADLINK: u8 = 22;
++pub const P9_RREADLINK: u8 = 23;
++pub const P9_TGETATTR: u8 = 24;
++pub const P9_RGETATTR: u8 = 25;
++pub const P9_TSETATTR: u8 = 26;
++pub const P9_RSETATTR: u8 = 27;
++pub const P9_TXATTRWALK: u8 = 30;
++pub const P9_RXATTRWALK: u8 = 31;
++pub const P9_TXATTRCREATE: u8 = 32;
++pub const P9_RXATTRCREATE: u8 = 33;
++pub const P9_TREADDIR: u8 = 40;
++pub const P9_RREADDIR: u8 = 41;
++pub const P9_TFSYNC: u8 = 50;
++pub const P9_RFSYNC: u8 = 51;
++pub const P9_TLOCK: u8 = 52;
++pub const P9_RLOCK: u8 = 53;
++pub const P9_TGETLOCK: u8 = 54;
++pub const P9_RGETLOCK: u8 = 55;
++pub const P9_TLINK: u8 = 70;
++pub const P9_RLINK: u8 = 71;
++pub const P9_TMKDIR: u8 = 72;
++pub const P9_RMKDIR: u8 = 73;
++pub const P9_TRENAMEAT: u8 = 74;
++pub const P9_RRENAMEAT: u8 = 75;
++pub const P9_TUNLINKAT: u8 = 76;
++pub const P9_RUNLINKAT: u8 = 77;
++pub const P9_TVERSION: u8 = 100;
++pub const P9_RVERSION: u8 = 101;
++pub const P9_TAUTH: u8 = 102;
++pub const P9_RAUTH: u8 = 103;
++pub const P9_TATTACH: u8 = 104;
++pub const P9_RATTACH: u8 = 105;
++pub const P9_TFLUSH: u8 = 108;
++pub const P9_RFLUSH: u8 = 109;
++pub const P9_TWALK: u8 = 110;
++pub const P9_RWALK: u8 = 111;
++pub const P9_TREAD: u8 = 116;
++pub const P9_RREAD: u8 = 117;
++pub const P9_TWRITE: u8 = 118;
++pub const P9_RWRITE: u8 = 119;
++pub const P9_TCLUNK: u8 = 120;
++pub const P9_RCLUNK: u8 = 121;
++pub const P9_TREMOVE: u8 = 122;
++pub const P9_RREMOVE: u8 = 123;
++
++// Getattr request mask bits.
++pub const P9_GETATTR_MODE: u64 = 0x00000001;
++pub const P9_GETATTR_NLINK: u64 = 0x00000002;
++pub const P9_GETATTR_UID: u64 = 0x00000004;
++pub const P9_GETATTR_GID: u64 = 0x00000008;
++pub const P9_GETATTR_RDEV: u64 = 0x00000010;
++pub const P9_GETATTR_ATIME: u64 = 0x00000020;
++pub const P9_GETATTR_MTIME: u64 = 0x00000040;
++pub const P9_GETATTR_CTIME: u64 = 0x00000080;
++pub const P9_GETATTR_INO: u64 = 0x00000100;
++pub const P9_GETATTR_SIZE: u64 = 0x00000200;
++pub const P9_GETATTR_BLOCKS: u64 = 0x00000400;
++pub const P9_GETATTR_BTIME: u64 = 0x00000800;
++pub const P9_GETATTR_GEN: u64 = 0x00001000;
++pub const P9_GETATTR_DATA_VERSION: u64 = 0x00002000;
++pub const P9_GETATTR_BASIC: u64 = 0x000007ff;
++pub const P9_GETATTR_ALL: u64 = 0x00003fff;
++
++// Setattr valid bits.
++pub const P9_SETATTR_MODE: u32 = 0x00000001;
++pub const P9_SETATTR_UID: u32 = 0x00000002;
++pub const P9_SETATTR_GID: u32 = 0x00000004;
++pub const P9_SETATTR_SIZE: u32 = 0x00000008;
++pub const P9_SETATTR_ATIME: u32 = 0x00000010;
++pub const P9_SETATTR_MTIME: u32 = 0x00000020;
++pub const P9_SETATTR_CTIME: u32 = 0x00000040;
++pub const P9_SETATTR_ATIME_SET: u32 = 0x00000080;
++pub const P9_SETATTR_MTIME_SET: u32 = 0x00000100;
++
++// AT_REMOVEDIR for unlinkat.
++pub const AT_REMOVEDIR: u32 = 0x200;
++
++/// QID type bits.
++pub const QID_TYPE_DIR: u8 = 0x80;
++pub const QID_TYPE_APPEND: u8 = 0x40;
++pub const QID_TYPE_EXCL: u8 = 0x20;
++pub const QID_TYPE_MOUNT: u8 = 0x10;
++pub const QID_TYPE_AUTH: u8 = 0x08;
++pub const QID_TYPE_TMP: u8 = 0x04;
++pub const QID_TYPE_SYMLINK: u8 = 0x02;
++pub const QID_TYPE_FILE: u8 = 0x00;
++
++/// 9P QID — unique server-side file identifier.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct P9Qid {
++    pub type_: u8,
++    pub version: u32,
++    pub path: u64,
++}
++
++impl P9Qid {
++    pub fn decode(buf: &[u8]) -> Option<(Self, usize)> {
++        if buf.len() < 13 {
++            return None;
++        }
++        let type_ = buf[0];
++        let version = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
++        let path = u64::from_le_bytes([
++            buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12],
++        ]);
++        Some((
++            P9Qid {
++                type_,
++                version,
++                path,
++            },
++            13,
++        ))
++    }
++
++    pub fn is_dir(&self) -> bool {
++        self.type_ & QID_TYPE_DIR != 0
++    }
++}
++
++/// 9P getattr response.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct P9Attr {
++    pub valid: u64,
++    pub qid: P9Qid,
++    pub mode: u32,
++    pub uid: u32,
++    pub gid: u32,
++    pub nlink: u64,
++    pub rdev: u64,
++    pub size: u64,
++    pub blksize: u64,
++    pub blocks: u64,
++    pub atime_sec: u64,
++    pub atime_nsec: u64,
++    pub mtime_sec: u64,
++    pub mtime_nsec: u64,
++    pub ctime_sec: u64,
++    pub ctime_nsec: u64,
++    pub btime_sec: u64,
++    pub btime_nsec: u64,
++    pub generation: u64,
++    pub data_version: u64,
++}
++
++impl P9Attr {
++    pub fn decode(buf: &[u8]) -> Option<(Self, usize)> {
++        if buf.len() < 160 {
++            return None;
++        }
++        let valid = read_u64_le(buf, 0);
++        let (qid, _) = P9Qid::decode(&buf[8..])?;
++        let mode = read_u32_le(buf, 21);
++        let uid = read_u32_le(buf, 25);
++        let gid = read_u32_le(buf, 29);
++        let nlink = read_u64_le(buf, 33);
++        let rdev = read_u64_le(buf, 41);
++        let size = read_u64_le(buf, 49);
++        let blksize = read_u64_le(buf, 57);
++        let blocks = read_u64_le(buf, 65);
++        let atime_sec = read_u64_le(buf, 73);
++        let atime_nsec = read_u64_le(buf, 81);
++        let mtime_sec = read_u64_le(buf, 89);
++        let mtime_nsec = read_u64_le(buf, 97);
++        let ctime_sec = read_u64_le(buf, 105);
++        let ctime_nsec = read_u64_le(buf, 113);
++        let btime_sec = read_u64_le(buf, 121);
++        let btime_nsec = read_u64_le(buf, 129);
++        let generation = read_u64_le(buf, 137);
++        let data_version = read_u64_le(buf, 145);
++        Some((
++            P9Attr {
++                valid,
++                qid,
++                mode,
++                uid,
++                gid,
++                nlink,
++                rdev,
++                size,
++                blksize,
++                blocks,
++                atime_sec,
++                atime_nsec,
++                mtime_sec,
++                mtime_nsec,
++                ctime_sec,
++                ctime_nsec,
++                btime_sec,
++                btime_nsec,
++                generation,
++                data_version,
++            },
++            160,
++        ))
++    }
++}
++
++/// 9P statfs response.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct P9StatFs {
++    pub fs_type: u32,
++    pub bsize: u32,
++    pub blocks: u64,
++    pub bfree: u64,
++    pub bavail: u64,
++    pub files: u64,
++    pub ffree: u64,
++    pub fsid: u64,
++    pub namelen: u32,
++}
++
++impl P9StatFs {
++    pub fn decode(buf: &[u8]) -> Option<Self> {
++        if buf.len() < 60 {
++            return None;
++        }
++        Some(P9StatFs {
++            fs_type: read_u32_le(buf, 0),
++            bsize: read_u32_le(buf, 4),
++            blocks: read_u64_le(buf, 8),
++            bfree: read_u64_le(buf, 16),
++            bavail: read_u64_le(buf, 24),
++            files: read_u64_le(buf, 32),
++            ffree: read_u64_le(buf, 40),
++            fsid: read_u64_le(buf, 48),
++            namelen: read_u32_le(buf, 56),
++        })
++    }
++}
++
++/// 9P directory entry from Rreaddir.
++#[derive(Debug, Clone)]
++pub struct P9DirEntry {
++    pub qid: P9Qid,
++    pub offset: u64,
++    pub type_: u8,
++    pub name: String,
++}
++
++/// Helper: encode a 9P string (len[2] + bytes) into a buffer.
++pub fn encode_string(buf: &mut Vec<u8>, s: &str) {
++    let len = s.len() as u16;
++    buf.extend_from_slice(&len.to_le_bytes());
++    buf.extend_from_slice(s.as_bytes());
++}
++
++/// Helper: decode a 9P string from a buffer, returning (string, bytes_consumed).
++pub fn decode_string(buf: &[u8]) -> Option<(String, usize)> {
++    if buf.len() < 2 {
++        return None;
++    }
++    let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
++    if buf.len() < 2 + len {
++        return None;
++    }
++    let s = core::str::from_utf8(&buf[2..2 + len]).ok()?.to_string();
++    Some((s, 2 + len))
++}
++
++/// Build a 9P message with header (size[4] + type[1] + tag[2]) + body.
++pub fn build_message(msg_type: u8, tag: u16, body: &[u8]) -> Vec<u8> {
++    let size = (P9_HEADER_SIZE + body.len()) as u32;
++    let mut msg = Vec::with_capacity(size as usize);
++    msg.extend_from_slice(&size.to_le_bytes());
++    msg.push(msg_type);
++    msg.extend_from_slice(&tag.to_le_bytes());
++    msg.extend_from_slice(body);
++    msg
++}
++
++/// Parse a 9P response header: returns (size, type, tag).
++pub fn parse_header(buf: &[u8]) -> Option<(u32, u8, u16)> {
++    if buf.len() < P9_HEADER_SIZE {
++        return None;
++    }
++    let size = read_u32_le(buf, 0);
++    let msg_type = buf[4];
++    let tag = u16::from_le_bytes([buf[5], buf[6]]);
++    Some((size, msg_type, tag))
++}
++
++/// Check if a response is an Rlerror. Returns Some(errno) if it is.
++pub fn check_rlerror(buf: &[u8]) -> Option<u32> {
++    let (_, msg_type, _) = parse_header(buf)?;
++    if msg_type == P9_RLERROR && buf.len() >= P9_HEADER_SIZE + 4 {
++        Some(read_u32_le(buf, P9_HEADER_SIZE))
++    } else {
++        None
++    }
++}
++
++/// Parse directory entries from Rreaddir payload.
++pub fn parse_readdir_entries(data: &[u8]) -> Vec<P9DirEntry> {
++    let mut entries = Vec::new();
++    let mut pos = 0;
++
++    while pos < data.len() {
++        // Each entry: qid[13] + offset[8] + type[1] + name[s]
++        if pos + 13 + 8 + 1 + 2 > data.len() {
++            break;
++        }
++        let (qid, _) = match P9Qid::decode(&data[pos..]) {
++            Some(q) => q,
++            None => break,
++        };
++        pos += 13;
++        let offset = read_u64_le(data, pos);
++        pos += 8;
++        let type_ = data[pos];
++        pos += 1;
++        let (name, consumed) = match decode_string(&data[pos..]) {
++            Some(s) => s,
++            None => break,
++        };
++        pos += consumed;
++
++        entries.push(P9DirEntry {
++            qid,
++            offset,
++            type_,
++            name,
++        });
++    }
++
++    entries
++}
++
++// Inline LE read helpers.
++#[inline]
++pub fn read_u16_le(buf: &[u8], offset: usize) -> u16 {
++    u16::from_le_bytes([buf[offset], buf[offset + 1]])
++}
++
++#[inline]
++pub fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
++    u32::from_le_bytes([
++        buf[offset],
++        buf[offset + 1],
++        buf[offset + 2],
++        buf[offset + 3],
++    ])
++}
++
++#[inline]
++pub fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
++    u64::from_le_bytes([
++        buf[offset],
++        buf[offset + 1],
++        buf[offset + 2],
++        buf[offset + 3],
++        buf[offset + 4],
++        buf[offset + 5],
++        buf[offset + 6],
++        buf[offset + 7],
++    ])
++}
+diff --git a/kernel/comps/virtio/src/lib.rs b/kernel/comps/virtio/src/lib.rs
+index 167bdd780..4d3a9ea6c 100644
+--- a/kernel/comps/virtio/src/lib.rs
++++ b/kernel/comps/virtio/src/lib.rs
+@@ -24,6 +24,7 @@ use device::{
+     input::device::InputDevice,
+     network::device::NetworkDevice,
+     socket::{self, device::SocketDevice},
++    transport9p::device::Transport9PDevice,
+ };
+ use log::{error, warn};
+ use spin::Once;
+@@ -78,6 +79,7 @@ fn virtio_component_init() -> Result<(), ComponentInitError> {
+             VirtioDeviceType::Console => ConsoleDevice::init(transport),
+             VirtioDeviceType::Socket => SocketDevice::init(transport),
+             VirtioDeviceType::FileSystem => FileSystemDevice::init(transport),
++            VirtioDeviceType::Transport9P => Transport9PDevice::init(transport),
+             _ => {
+                 warn!("[Virtio]: Found unimplemented device:{:?}", device_type);
+                 Ok(())
+@@ -116,6 +118,9 @@ fn negotiate_features(transport: &mut Box<dyn VirtioTransport>) {
+         VirtioDeviceType::FileSystem => {
+             FileSystemDevice::negotiate_features(device_specified_features)
+         }
++        VirtioDeviceType::Transport9P => {
++            Transport9PDevice::negotiate_features(device_specified_features)
++        }
+         _ => device_specified_features,
+     };
+     let mut support_feature = Feature::from_bits_truncate(features);
+diff --git a/kernel/src/fs/mod.rs b/kernel/src/fs/mod.rs
+index 9a01df7b1..5ede0c00e 100644
+--- a/kernel/src/fs/mod.rs
++++ b/kernel/src/fs/mod.rs
+@@ -23,6 +23,7 @@ pub mod sysfs;
+ pub mod thread_info;
+ pub mod tmpfs;
+ pub mod utils;
++pub mod virtio9p;
+ pub mod virtiofs;
+ 
+ use crate::{
+@@ -50,6 +51,7 @@ pub fn init() {
+     exfat::init();
+     overlayfs::init();
+     virtiofs::init();
++    virtio9p::init();
+ 
+     path::init();
+ }
+diff --git a/kernel/src/fs/virtio9p/fid.rs b/kernel/src/fs/virtio9p/fid.rs
+new file mode 100644
+index 000000000..28c0c9cfd
+--- /dev/null
++++ b/kernel/src/fs/virtio9p/fid.rs
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! FID manager for 9P — manages server-side file identifiers.
++
++use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicU32, Ordering};
++
++use aster_virtio::device::transport9p::{
++    device::Transport9PDevice,
++    protocol::{P9Qid, P9_NOFID},
++};
++use log::warn;
++use ostd::sync::SpinLock;
++
++/// Information tracked per active FID.
++#[derive(Debug, Clone)]
++pub(super) struct FidInfo {
++    pub qid: Option<P9Qid>,
++}
++
++/// Manages FID allocation and tracking for a 9P session.
++pub(super) struct FidManager {
++    device: Arc<Transport9PDevice>,
++    next_fid: AtomicU32,
++    active_fids: SpinLock<BTreeMap<u32, FidInfo>>,
++}
++
++impl FidManager {
++    pub fn new(device: Arc<Transport9PDevice>) -> Self {
++        Self {
++            device,
++            next_fid: AtomicU32::new(1),
++            active_fids: SpinLock::new(BTreeMap::new()),
++        }
++    }
++
++    /// Allocate a new unique FID number.
++    pub fn alloc_fid(&self) -> u32 {
++        let fid = self.next_fid.fetch_add(1, Ordering::Relaxed);
++        self.active_fids
++            .disable_irq()
++            .lock()
++            .insert(fid, FidInfo { qid: None });
++        fid
++    }
++
++    /// Walk from parent_fid along names, allocating a new FID.
++    /// Returns (new_fid, qids_from_walk).
++    pub fn walk(
++        &self,
++        parent_fid: u32,
++        names: &[&str],
++    ) -> Result<(u32, Vec<P9Qid>), aster_virtio::device::VirtioDeviceError> {
++        let newfid = self.alloc_fid();
++        match self.device.p9_walk(parent_fid, newfid, names) {
++            Ok(qids) => {
++                if let Some(qid) = qids.last() {
++                    self.active_fids
++                        .disable_irq()
++                        .lock()
++                        .entry(newfid)
++                        .and_modify(|info| info.qid = Some(*qid));
++                }
++                Ok((newfid, qids))
++            }
++            Err(e) => {
++                // Walk failed; remove the FID from tracking.
++                self.active_fids.disable_irq().lock().remove(&newfid);
++                Err(e)
++            }
++        }
++    }
++
++    /// Clone a FID by walking with empty names.
++    pub fn clone_fid(
++        &self,
++        fid: u32,
++    ) -> Result<u32, aster_virtio::device::VirtioDeviceError> {
++        let (newfid, _) = self.walk(fid, &[])?;
++        Ok(newfid)
++    }
++
++    /// Clunk (release) a FID.
++    pub fn clunk(&self, fid: u32) {
++        if fid == P9_NOFID {
++            return;
++        }
++        self.active_fids.disable_irq().lock().remove(&fid);
++        if let Err(e) = self.device.p9_clunk(fid) {
++            warn!("9P clunk fid {} failed: {:?}", fid, e);
++        }
++    }
++
++    pub fn device(&self) -> &Arc<Transport9PDevice> {
++        &self.device
++    }
++}
++
++impl Drop for FidManager {
++    fn drop(&mut self) {
++        let fids: Vec<u32> = self.active_fids.get_mut().keys().copied().collect();
++        for fid in fids {
++            let _ = self.device.p9_clunk(fid);
++        }
++    }
++}
+diff --git a/kernel/src/fs/virtio9p/fs.rs b/kernel/src/fs/virtio9p/fs.rs
+new file mode 100644
+index 000000000..d7fb4bf62
+--- /dev/null
++++ b/kernel/src/fs/virtio9p/fs.rs
+@@ -0,0 +1,200 @@
++// SPDX-License-Identifier: MPL-2.0
++
++mod handle;
++mod inode;
++
++use aster_virtio::device::transport9p::{
++    device::{Transport9PDevice, get_device_by_tag},
++    protocol::{P9_GETATTR_ALL, P9_NOFID, P9Attr},
++};
++
++use self::inode::Virtio9PInode;
++use super::fid::FidManager;
++use crate::{
++    fs::{
++        registry::{FsProperties, FsType},
++        utils::{FileSystem, FsEventSubscriberStats, FsFlags, Inode, Metadata, SuperBlock},
++    },
++    prelude::*,
++};
++
++const P9_MAGIC: u64 = 0x01021997; // 9P2000
++const BLOCK_SIZE: usize = 4096;
++const NAME_MAX: usize = 255;
++
++pub(super) const S_IFREG: u32 = 0o100000;
++pub(super) const S_IFDIR: u32 = 0o040000;
++pub(super) const S_IFSOCK: u32 = 0o140000;
++pub(super) const S_IFBLK: u32 = 0o060000;
++pub(super) const S_IFCHR: u32 = 0o020000;
++pub(super) const S_IFIFO: u32 = 0o010000;
++pub(super) const O_RDONLY: u32 = 0;
++pub(super) const O_WRONLY: u32 = 1;
++pub(super) const O_RDWR: u32 = 2;
++pub(super) const P9_READDIR_BUF_SIZE: u32 = 4096;
++
++pub(super) struct Virtio9PFsType;
++
++impl FsType for Virtio9PFsType {
++    fn name(&self) -> &'static str {
++        "9p"
++    }
++
++    fn properties(&self) -> FsProperties {
++        FsProperties::empty()
++    }
++
++    fn create(
++        &self,
++        _flags: FsFlags,
++        args: Option<CString>,
++        _disk: Option<Arc<dyn aster_block::BlockDevice>>,
++    ) -> Result<Arc<dyn FileSystem>> {
++        let tag = args
++            .as_ref()
++            .ok_or_else(|| Error::with_message(Errno::EINVAL, "9p source(tag) is required"))?
++            .to_str()
++            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid 9p tag"))?
++            .to_string();
++
++        let device = get_device_by_tag(&tag)
++            .ok_or_else(|| Error::with_message(Errno::ENODEV, "9p device tag not found"))?;
++
++        Ok(Virtio9P::new(device, tag)? as _)
++    }
++
++    fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {
++        None
++    }
++}
++
++pub(super) struct Virtio9P {
++    sb: SuperBlock,
++    root: Arc<Virtio9PInode>,
++    tag: String,
++    pub(super) fid_mgr: Arc<FidManager>,
++    pub(super) root_fid: u32,
++    fs_event_subscriber_stats: FsEventSubscriberStats,
++}
++
++impl Virtio9P {
++    fn new(device: Arc<Transport9PDevice>, tag: String) -> Result<Arc<Self>> {
++        let fid_mgr = Arc::new(FidManager::new(device.clone()));
++
++        // Allocate a FID for the root and attach.
++        let root_fid = fid_mgr.alloc_fid();
++        let root_qid = device
++            .p9_attach(root_fid, P9_NOFID, "", "", 0)
++            .map_err(|_| Error::with_message(Errno::EIO, "9p attach failed"))?;
++
++        // Get attributes of root.
++        let root_attr = device
++            .p9_getattr(root_fid, P9_GETATTR_ALL)
++            .map_err(|_| Error::with_message(Errno::EIO, "9p getattr root failed"))?;
++
++        let root_metadata = p9_attr_to_metadata(&root_attr);
++
++        // Get filesystem statistics for the superblock.
++        let sb = match device.p9_statfs(root_fid) {
++            Ok(statfs) => SuperBlock {
++                magic: P9_MAGIC,
++                bsize: statfs.bsize as usize,
++                blocks: statfs.blocks as usize,
++                bfree: statfs.bfree as usize,
++                bavail: statfs.bavail as usize,
++                files: statfs.files as usize,
++                ffree: statfs.ffree as usize,
++                fsid: statfs.fsid,
++                namelen: statfs.namelen as usize,
++                frsize: statfs.bsize as usize,
++                flags: 0,
++            },
++            Err(_) => SuperBlock::new(P9_MAGIC, BLOCK_SIZE, NAME_MAX),
++        };
++
++        Ok(Arc::new_cyclic(|weak_fs| {
++            let root = Virtio9PInode::new(root_fid, root_qid, root_metadata, weak_fs.clone());
++
++            Self {
++                sb,
++                root,
++                tag,
++                fid_mgr,
++                root_fid,
++                fs_event_subscriber_stats: FsEventSubscriberStats::new(),
++            }
++        }))
++    }
++}
++
++impl FileSystem for Virtio9P {
++    fn name(&self) -> &'static str {
++        "9p"
++    }
++
++    fn source(&self) -> Option<&str> {
++        Some(&self.tag)
++    }
++
++    fn sync(&self) -> Result<()> {
++        Ok(())
++    }
++
++    fn root_inode(&self) -> Arc<dyn Inode> {
++        self.root.clone()
++    }
++
++    fn sb(&self) -> SuperBlock {
++        self.sb.clone()
++    }
++
++    fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
++        &self.fs_event_subscriber_stats
++    }
++}
++
++/// Convert P9Attr to kernel Metadata.
++pub(super) fn p9_attr_to_metadata(attr: &P9Attr) -> Metadata {
++    use core::time::Duration;
++
++    use crate::{
++        fs::utils::{InodeMode, InodeType},
++        process::{Gid, Uid},
++    };
++
++    Metadata {
++        dev: 0,
++        ino: attr.qid.path,
++        size: attr.size as usize,
++        blk_size: if attr.blksize > 0 {
++            attr.blksize as usize
++        } else {
++            4096
++        },
++        blocks: attr.blocks as usize,
++        atime: Duration::new(attr.atime_sec, attr.atime_nsec as u32),
++        mtime: Duration::new(attr.mtime_sec, attr.mtime_nsec as u32),
++        ctime: Duration::new(attr.ctime_sec, attr.ctime_nsec as u32),
++        type_: InodeType::from_raw_mode(attr.mode as u16).unwrap_or(InodeType::Unknown),
++        mode: InodeMode::from_bits_truncate(attr.mode as u16),
++        nlinks: attr.nlink as usize,
++        uid: Uid::new(attr.uid),
++        gid: Gid::new(attr.gid),
++        rdev: attr.rdev,
++    }
++}
++
++/// Convert dirent type byte to InodeType.
++pub(super) fn inode_type_from_dirent_type(type_: u8) -> crate::fs::utils::InodeType {
++    use crate::fs::utils::InodeType;
++    match type_ {
++        4 => InodeType::Dir,
++        8 => InodeType::File,
++        10 => InodeType::SymLink,
++        2 => InodeType::CharDevice,
++        6 => InodeType::BlockDevice,
++        1 => InodeType::NamedPipe,
++        12 => InodeType::Socket,
++        _ => InodeType::Unknown,
++    }
++}
+diff --git a/kernel/src/fs/virtio9p/fs/handle.rs b/kernel/src/fs/virtio9p/fs/handle.rs
+new file mode 100644
+index 000000000..c03263b41
+--- /dev/null
++++ b/kernel/src/fs/virtio9p/fs/handle.rs
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use super::inode::Virtio9PInode;
++use crate::{
++    events::IoEvents,
++    fs::{
++        inode_handle::FileIo,
++        utils::{Inode, InodeIo, SeekFrom, StatusFlags},
++    },
++    prelude::*,
++    process::signal::{PollHandle, Pollable},
++};
++
++pub(super) struct Virtio9PHandle {
++    inode: Arc<Virtio9PInode>,
++    open_fid: u32,
++    #[allow(unused)]
++    flags: u32,
++    cache_enabled: bool,
++}
++
++impl Virtio9PHandle {
++    pub(super) fn new(
++        inode: Arc<Virtio9PInode>,
++        open_fid: u32,
++        flags: u32,
++        cache_enabled: bool,
++    ) -> Self {
++        Self {
++            inode,
++            open_fid,
++            flags,
++            cache_enabled,
++        }
++    }
++}
++
++impl Drop for Virtio9PHandle {
++    fn drop(&mut self) {
++        if self.cache_enabled {
++            let _ = self.inode.flush_page_cache();
++        }
++        if let Some(fs) = self.inode.try_fs_ref() {
++            fs.fid_mgr.clunk(self.open_fid);
++        }
++    }
++}
++
++impl Pollable for Virtio9PHandle {
++    fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
++        let events = IoEvents::IN | IoEvents::OUT;
++        events & mask
++    }
++}
++
++impl InodeIo for Virtio9PHandle {
++    fn read_at(
++        &self,
++        offset: usize,
++        writer: &mut VmWriter,
++        _status_flags: StatusFlags,
++    ) -> Result<usize> {
++        if self.cache_enabled {
++            self.inode.cached_read_at(offset, writer)
++        } else {
++            self.inode.direct_read_at(offset, writer)
++        }
++    }
++
++    fn write_at(
++        &self,
++        offset: usize,
++        reader: &mut VmReader,
++        status_flags: StatusFlags,
++    ) -> Result<usize> {
++        let offset = if status_flags.contains(StatusFlags::O_APPEND) {
++            self.inode.revalidate_attr()?;
++            self.inode.size()
++        } else {
++            offset
++        };
++
++        if self.cache_enabled {
++            self.inode.cached_write_at(offset, reader)
++        } else {
++            self.inode.direct_write_at(offset, reader)
++        }
++    }
++}
++
++impl FileIo for Virtio9PHandle {
++    fn check_seekable(&self) -> Result<()> {
++        Ok(())
++    }
++
++    fn is_offset_aware(&self) -> bool {
++        true
++    }
++
++    fn seek(&self, offset: &Mutex<usize>, pos: SeekFrom) -> Result<usize> {
++        let new_offset = match pos {
++            SeekFrom::Start(off) => off as usize,
++            SeekFrom::Current(diff) => {
++                let cur = *offset.lock();
++                if diff >= 0 {
++                    cur.checked_add(diff as usize)
++                        .ok_or_else(|| Error::with_message(Errno::EOVERFLOW, "seek overflow"))?
++                } else {
++                    cur.checked_sub((-diff) as usize)
++                        .ok_or_else(|| Error::with_message(Errno::EINVAL, "seek before start"))?
++                }
++            }
++            SeekFrom::End(diff) => {
++                let file_size = self.inode.size();
++                if diff >= 0 {
++                    file_size
++                        .checked_add(diff as usize)
++                        .ok_or_else(|| Error::with_message(Errno::EOVERFLOW, "seek overflow"))?
++                } else {
++                    file_size
++                        .checked_sub((-diff) as usize)
++                        .ok_or_else(|| Error::with_message(Errno::EINVAL, "seek before start"))?
++                }
++            }
++        };
++
++        *offset.lock() = new_offset;
++        Ok(new_offset)
++    }
++}
+diff --git a/kernel/src/fs/virtio9p/fs/inode.rs b/kernel/src/fs/virtio9p/fs/inode.rs
+new file mode 100644
+index 000000000..3213ce2f7
+--- /dev/null
++++ b/kernel/src/fs/virtio9p/fs/inode.rs
+@@ -0,0 +1,767 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use core::time::Duration;
++
++use aster_block::bio::BioWaiter;
++use aster_virtio::device::transport9p::protocol::{
++    AT_REMOVEDIR, P9_GETATTR_ALL, P9_SETATTR_ATIME, P9_SETATTR_ATIME_SET, P9_SETATTR_GID,
++    P9_SETATTR_MODE, P9_SETATTR_MTIME, P9_SETATTR_MTIME_SET, P9_SETATTR_SIZE, P9_SETATTR_UID,
++    P9Qid,
++};
++use ostd::mm::{HasSize, io_util::HasVmReaderWriter};
++
++use super::{
++    O_RDONLY, O_RDWR, O_WRONLY, P9_READDIR_BUF_SIZE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFREG,
++    S_IFSOCK, Virtio9P, handle::Virtio9PHandle, inode_type_from_dirent_type, p9_attr_to_metadata,
++};
++use crate::{
++    fs::{
++        inode_handle::FileIo,
++        utils::{
++            AccessMode, CachePage, DirentVisitor, Extension, FileSystem, Inode, InodeIo, InodeMode,
++            InodeType, Metadata, MknodType, PageCache, PageCacheBackend, StatusFlags, SymbolicLink,
++        },
++    },
++    prelude::*,
++    process::{Gid, Uid},
++    vm::vmo::Vmo,
++};
++
++const PAGE_SIZE: usize = 4096;
++
++pub(super) struct Virtio9PInode {
++    this: Weak<Virtio9PInode>,
++    fid: u32,
++    qid: RwLock<P9Qid>,
++    metadata: RwLock<Metadata>,
++    page_cache: Option<Mutex<PageCache>>,
++    /// A persistent open FID for page cache I/O.
++    page_cache_fid: Mutex<Option<u32>>,
++    fs: Weak<Virtio9P>,
++    extension: Extension,
++}
++
++impl Virtio9PInode {
++    pub(super) fn new(fid: u32, qid: P9Qid, metadata: Metadata, fs: Weak<Virtio9P>) -> Arc<Self> {
++        Arc::new_cyclic(|weak_self| Self {
++            this: weak_self.clone(),
++            fid,
++            qid: RwLock::new(qid),
++            metadata: RwLock::new(metadata),
++            page_cache: metadata.type_.is_regular_file().then(|| {
++                Mutex::new(PageCache::with_capacity(metadata.size, weak_self.clone() as _).unwrap())
++            }),
++            page_cache_fid: Mutex::new(None),
++            fs,
++            extension: Extension::new(),
++        })
++    }
++
++    pub(super) fn fs_ref(&self) -> Arc<Virtio9P> {
++        self.fs.upgrade().unwrap()
++    }
++
++    pub(super) fn try_fs_ref(&self) -> Option<Arc<Virtio9P>> {
++        self.fs.upgrade()
++    }
++
++    pub(super) fn revalidate_attr(&self) -> Result<()> {
++        let fs = self.fs_ref();
++        let attr = fs
++            .fid_mgr
++            .device()
++            .p9_getattr(self.fid, P9_GETATTR_ALL)
++            .map_err(|_| Error::with_message(Errno::EIO, "9p getattr failed"))?;
++
++        let old_metadata = self.metadata();
++        let new_metadata = p9_attr_to_metadata(&attr);
++        if old_metadata.mtime != new_metadata.mtime {
++            self.invalidate_page_cache(new_metadata.size)?;
++        }
++        *self.metadata.write() = new_metadata;
++        *self.qid.write() = attr.qid;
++
++        Ok(())
++    }
++
++    fn invalidate_page_cache(&self, new_size: usize) -> Result<()> {
++        let Some(page_cache) = &self.page_cache else {
++            return Ok(());
++        };
++
++        let page_cache = &mut page_cache.lock();
++        let cached_size = page_cache.pages().size();
++        if cached_size > 0 {
++            page_cache.discard_range(0..cached_size);
++            page_cache.resize(0)?;
++        }
++        page_cache.resize(new_size)?;
++
++        Ok(())
++    }
++
++    pub(super) fn flush_page_cache(&self) -> Result<()> {
++        let Some(page_cache) = &self.page_cache else {
++            return Ok(());
++        };
++
++        page_cache.lock().evict_range(0..self.size())?;
++        Ok(())
++    }
++
++    fn get_or_open_page_cache_fid(&self) -> Result<u32> {
++        let mut fid_slot = self.page_cache_fid.lock();
++        if let Some(fid) = *fid_slot {
++            return Ok(fid);
++        }
++
++        let fs = self.fs_ref();
++        let open_fid = fs
++            .fid_mgr
++            .clone_fid(self.fid)
++            .map_err(|_| Error::with_message(Errno::EIO, "9p clone fid for page cache failed"))?;
++
++        fs.fid_mgr
++            .device()
++            .p9_lopen(open_fid, O_RDWR)
++            .map_err(|_| {
++                fs.fid_mgr.clunk(open_fid);
++                Error::with_message(Errno::EIO, "9p lopen for page cache failed")
++            })?;
++
++        *fid_slot = Some(open_fid);
++        Ok(open_fid)
++    }
++
++    fn release_page_cache_fid(&self) {
++        let Some(fs) = self.fs.upgrade() else {
++            return;
++        };
++
++        if let Some(fid) = self.page_cache_fid.lock().take() {
++            fs.fid_mgr.clunk(fid);
++        }
++    }
++
++    pub(super) fn cached_read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        self.revalidate_attr()?;
++
++        let Some(page_cache) = &self.page_cache else {
++            return self.direct_read_at(offset, writer);
++        };
++
++        let file_size = self.size();
++        let start = file_size.min(offset);
++        let end = file_size.min(offset + writer.avail());
++        let read_len = end - start;
++        page_cache.lock().pages().read(start, writer)?;
++        Ok(read_len)
++    }
++
++    pub(super) fn direct_read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        self.revalidate_attr()?;
++
++        let file_size = self.size();
++        let start = file_size.min(offset);
++        let end = file_size.min(offset + writer.avail());
++        let read_len = end - start;
++        if read_len == 0 {
++            return Ok(0);
++        }
++
++        let fs = self.fs_ref();
++        let read_fid = fs.fid_mgr.clone_fid(self.fid).map_err(Error::from)?;
++
++        let result = (|| -> Result<usize> {
++            fs.fid_mgr
++                .device()
++                .p9_lopen(read_fid, O_RDONLY)
++                .map_err(|_| Error::with_message(Errno::EIO, "9p lopen for read failed"))?;
++
++            let max_len = read_len.min(u32::MAX as usize) as u32;
++            let data = fs
++                .fid_mgr
++                .device()
++                .p9_read(read_fid, start as u64, max_len)
++                .map_err(|_| Error::with_message(Errno::EIO, "9p read failed"))?;
++
++            let mut reader = VmReader::from(data.as_slice());
++            writer.write_fallible(&mut reader)?;
++            Ok(read_len.min(data.len()))
++        })();
++
++        fs.fid_mgr.clunk(read_fid);
++        result
++    }
++
++    pub(super) fn cached_write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
++        let Some(page_cache) = &self.page_cache else {
++            return self.direct_write_at(offset, reader);
++        };
++        let page_cache = page_cache.lock();
++
++        let write_len = reader.remain();
++        let new_size = offset + write_len;
++        if new_size > page_cache.pages().size() {
++            page_cache.resize(new_size)?;
++        }
++        {
++            let mut metadata = self.metadata.write();
++            metadata.size = metadata.size.max(new_size);
++            metadata.blocks = metadata.size.div_ceil(metadata.blk_size.max(1));
++        }
++        page_cache.pages().write(offset, reader)?;
++
++        Ok(write_len)
++    }
++
++    pub(super) fn direct_write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
++        let write_len = reader.remain().min(u32::MAX as usize);
++        let mut data = vec![0u8; write_len];
++        reader.read_fallible(&mut VmWriter::from(data.as_mut_slice()))?;
++
++        let fs = self.fs_ref();
++        let write_fid = fs.fid_mgr.clone_fid(self.fid).map_err(Error::from)?;
++
++        let result = (|| -> Result<usize> {
++            fs.fid_mgr
++                .device()
++                .p9_lopen(write_fid, O_WRONLY)
++                .map_err(|_| Error::with_message(Errno::EIO, "9p lopen for write failed"))?;
++
++            let written = fs
++                .fid_mgr
++                .device()
++                .p9_write(write_fid, offset as u64, &data)
++                .map_err(|_| Error::with_message(Errno::EIO, "9p write failed"))?
++                as usize;
++
++            let new_size = offset + written;
++            {
++                let mut metadata = self.metadata.write();
++                metadata.size = metadata.size.max(new_size);
++                metadata.blocks = metadata.size.div_ceil(metadata.blk_size.max(1));
++            }
++
++            self.invalidate_page_cache(self.size())?;
++            Ok(written)
++        })();
++
++        fs.fid_mgr.clunk(write_fid);
++        result
++    }
++
++    fn open_handle(&self, access_mode: AccessMode) -> Result<Virtio9PHandle> {
++        let flags = match access_mode {
++            AccessMode::O_RDONLY => O_RDONLY,
++            AccessMode::O_WRONLY => O_WRONLY,
++            AccessMode::O_RDWR => O_RDWR,
++        };
++
++        let fs = self.fs_ref();
++        let open_fid = fs.fid_mgr.clone_fid(self.fid).map_err(Error::from)?;
++
++        match fs.fid_mgr.device().p9_lopen(open_fid, flags) {
++            Ok(_) => {}
++            Err(_) => {
++                fs.fid_mgr.clunk(open_fid);
++                return_errno_with_message!(Errno::EIO, "9p lopen failed");
++            }
++        }
++
++        let Some(inode) = self.this.upgrade() else {
++            fs.fid_mgr.clunk(open_fid);
++            return_errno_with_message!(Errno::EIO, "9p inode is unavailable");
++        };
++
++        let cache_enabled = self.page_cache.is_some();
++        Ok(Virtio9PHandle::new(inode, open_fid, flags, cache_enabled))
++    }
++
++    fn apply_setattr(
++        &self,
++        valid: u32,
++        mode: u32,
++        uid: u32,
++        gid: u32,
++        size: u64,
++        atime_sec: u64,
++        atime_nsec: u64,
++        mtime_sec: u64,
++        mtime_nsec: u64,
++    ) -> Result<()> {
++        let fs = self.fs_ref();
++        fs.fid_mgr
++            .device()
++            .p9_setattr(
++                self.fid, valid, mode, uid, gid, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec,
++            )
++            .map_err(Error::from)?;
++
++        // Re-fetch attributes after setattr.
++        self.revalidate_attr()?;
++        Ok(())
++    }
++}
++
++impl Drop for Virtio9PInode {
++    fn drop(&mut self) {
++        self.release_page_cache_fid();
++        // Don't clunk the root fid — it's managed by the filesystem.
++        let Some(fs) = self.fs.upgrade() else {
++            return;
++        };
++        if self.fid != fs.root_fid {
++            fs.fid_mgr.clunk(self.fid);
++        }
++    }
++}
++
++impl PageCacheBackend for Virtio9PInode {
++    fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
++        let offset = idx * PAGE_SIZE;
++        if offset >= self.size() {
++            return_errno_with_message!(Errno::EINVAL, "9p page read beyond EOF");
++        }
++
++        frame.writer().fill_zeros(frame.size());
++        let size = (self.size() - offset).min(PAGE_SIZE).min(u32::MAX as usize) as u32;
++        let fs = self.fs_ref();
++        let fh = self.get_or_open_page_cache_fid()?;
++        let data = fs
++            .fid_mgr
++            .device()
++            .p9_read(fh, offset as u64, size)
++            .map_err(|_| Error::with_message(Errno::EIO, "9p page read failed"))?;
++        let mut frame_writer = frame.writer();
++        frame_writer.write_fallible(&mut VmReader::from(data.as_slice()).to_fallible())?;
++        Ok(BioWaiter::new())
++    }
++
++    fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
++        let offset = idx * PAGE_SIZE;
++        let file_size = self.size();
++        if offset >= file_size {
++            return Ok(BioWaiter::new());
++        }
++
++        let write_len = (file_size - offset).min(PAGE_SIZE);
++        let mut data = vec![0u8; write_len];
++        let mut writer = VmWriter::from(data.as_mut_slice());
++        writer.write_fallible(&mut frame.reader().to_fallible())?;
++
++        let fs = self.fs_ref();
++        let fh = self.get_or_open_page_cache_fid()?;
++        fs.fid_mgr
++            .device()
++            .p9_write(fh, offset as u64, &data)
++            .map_err(|_| Error::with_message(Errno::EIO, "9p page write failed"))?;
++        Ok(BioWaiter::new())
++    }
++
++    fn npages(&self) -> usize {
++        self.size().div_ceil(PAGE_SIZE)
++    }
++}
++
++impl InodeIo for Virtio9PInode {
++    fn read_at(
++        &self,
++        offset: usize,
++        writer: &mut VmWriter,
++        _status_flags: StatusFlags,
++    ) -> Result<usize> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::File {
++            return_errno_with_message!(Errno::EISDIR, "inode is not a regular file");
++        }
++
++        self.cached_read_at(offset, writer)
++    }
++
++    fn write_at(
++        &self,
++        offset: usize,
++        reader: &mut VmReader,
++        status_flags: StatusFlags,
++    ) -> Result<usize> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::File {
++            return_errno_with_message!(Errno::EISDIR, "inode is not a regular file");
++        }
++
++        let offset = if status_flags.contains(StatusFlags::O_APPEND) {
++            self.revalidate_attr()?;
++            self.size()
++        } else {
++            offset
++        };
++
++        self.cached_write_at(offset, reader)
++    }
++}
++
++impl Inode for Virtio9PInode {
++    fn size(&self) -> usize {
++        self.metadata.read().size
++    }
++
++    fn resize(&self, new_size: usize) -> Result<()> {
++        if self.metadata.read().type_ != InodeType::File {
++            return_errno_with_message!(Errno::EISDIR, "resize on non-regular file");
++        }
++
++        let size = u64::try_from(new_size)
++            .map_err(|_| Error::with_message(Errno::EFBIG, "9p resize size too large"))?;
++
++        self.apply_setattr(P9_SETATTR_SIZE, 0, 0, 0, size, 0, 0, 0, 0)
++    }
++
++    fn metadata(&self) -> Metadata {
++        *self.metadata.read()
++    }
++
++    fn ino(&self) -> u64 {
++        self.qid.read().path
++    }
++
++    fn type_(&self) -> InodeType {
++        self.metadata.read().type_
++    }
++
++    fn mode(&self) -> Result<InodeMode> {
++        Ok(self.metadata.read().mode)
++    }
++
++    fn set_mode(&self, mode: InodeMode) -> Result<()> {
++        let mode_bits = (self.type_() as u32) | u32::from(mode.bits());
++        self.apply_setattr(P9_SETATTR_MODE, mode_bits, 0, 0, 0, 0, 0, 0, 0)
++    }
++
++    fn owner(&self) -> Result<Uid> {
++        Ok(self.metadata.read().uid)
++    }
++
++    fn set_owner(&self, uid: Uid) -> Result<()> {
++        self.apply_setattr(P9_SETATTR_UID, 0, uid.into(), 0, 0, 0, 0, 0, 0)
++    }
++
++    fn group(&self) -> Result<Gid> {
++        Ok(self.metadata.read().gid)
++    }
++
++    fn set_group(&self, gid: Gid) -> Result<()> {
++        self.apply_setattr(P9_SETATTR_GID, 0, 0, gid.into(), 0, 0, 0, 0, 0)
++    }
++
++    fn atime(&self) -> Duration {
++        self.metadata.read().atime
++    }
++
++    fn set_atime(&self, time: Duration) {
++        if let Err(err) = self.apply_setattr(
++            P9_SETATTR_ATIME | P9_SETATTR_ATIME_SET,
++            0,
++            0,
++            0,
++            0,
++            time.as_secs(),
++            time.subsec_nanos() as u64,
++            0,
++            0,
++        ) {
++            warn!("9p set_atime failed for fid {}: {:?}", self.fid, err);
++        }
++    }
++
++    fn mtime(&self) -> Duration {
++        self.metadata.read().mtime
++    }
++
++    fn set_mtime(&self, time: Duration) {
++        if let Err(err) = self.apply_setattr(
++            P9_SETATTR_MTIME | P9_SETATTR_MTIME_SET,
++            0,
++            0,
++            0,
++            0,
++            0,
++            0,
++            time.as_secs(),
++            time.subsec_nanos() as u64,
++        ) {
++            warn!("9p set_mtime failed for fid {}: {:?}", self.fid, err);
++        }
++    }
++
++    fn ctime(&self) -> Duration {
++        self.metadata.read().ctime
++    }
++
++    fn set_ctime(&self, _time: Duration) {
++        // ctime is automatically updated by the server; ignore client requests.
++    }
++
++    fn page_cache(&self) -> Option<Arc<Vmo>> {
++        self.page_cache
++            .as_ref()
++            .map(|page_cache| page_cache.lock().pages().clone())
++    }
++
++    fn open(
++        &self,
++        access_mode: AccessMode,
++        _status_flags: StatusFlags,
++    ) -> Option<Result<Box<dyn FileIo>>> {
++        if self.metadata.read().type_ != InodeType::File {
++            return None;
++        }
++        Some(
++            self.open_handle(access_mode)
++                .map(|handle| Box::new(handle) as Box<dyn FileIo>),
++        )
++    }
++
++    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::Dir {
++            return_errno_with_message!(Errno::ENOTDIR, "lookup on non-directory");
++        }
++
++        let fs = self.fs_ref();
++        let (newfid, qids) = fs.fid_mgr.walk(self.fid, &[name]).map_err(Error::from)?;
++
++        if qids.is_empty() {
++            fs.fid_mgr.clunk(newfid);
++            return_errno_with_message!(Errno::ENOENT, "9p walk returned no qids");
++        }
++
++        let qid = qids[0];
++        let attr = fs
++            .fid_mgr
++            .device()
++            .p9_getattr(newfid, P9_GETATTR_ALL)
++            .map_err(|e| {
++                fs.fid_mgr.clunk(newfid);
++                Error::from(e)
++            })?;
++
++        let child_metadata = p9_attr_to_metadata(&attr);
++        let inode = Virtio9PInode::new(newfid, qid, child_metadata, Arc::downgrade(&fs));
++
++        Ok(inode)
++    }
++
++    fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn Inode>> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::Dir {
++            return_errno_with_message!(Errno::ENOTDIR, "create on non-directory");
++        }
++
++        let fs = self.fs_ref();
++        let device = fs.fid_mgr.device();
++        let mode_bits = mode.bits() as u32;
++
++        match type_ {
++            InodeType::File => {
++                // Walk to get a new fid for the parent, then lcreate on it.
++                let create_fid = fs.fid_mgr.clone_fid(self.fid).map_err(Error::from)?;
++                match device.p9_lcreate(create_fid, name, O_RDWR, S_IFREG | mode_bits, 0) {
++                    Ok(_) => {
++                        // lcreate changes create_fid to point to the new file.
++                        // Clunk it since we'll walk to the file separately.
++                        fs.fid_mgr.clunk(create_fid);
++                    }
++                    Err(e) => {
++                        fs.fid_mgr.clunk(create_fid);
++                        return Err(Error::from(e));
++                    }
++                }
++            }
++            InodeType::Dir => {
++                device
++                    .p9_mkdir(self.fid, name, S_IFDIR | mode_bits, 0)
++                    .map_err(Error::from)?;
++            }
++            InodeType::Socket => {
++                device
++                    .p9_mknod(self.fid, name, S_IFSOCK | mode_bits, 0, 0, 0)
++                    .map_err(Error::from)?;
++            }
++            _ => {
++                return_errno_with_message!(
++                    Errno::EOPNOTSUPP,
++                    "9p create supports file/dir/socket only"
++                );
++            }
++        }
++
++        // Walk to the newly created entry to get a fresh fid.
++        self.lookup(name)
++    }
++
++    fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn Inode>> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::Dir {
++            return_errno_with_message!(Errno::ENOTDIR, "mknod on non-directory");
++        }
++
++        let fs = self.fs_ref();
++        let device = fs.fid_mgr.device();
++        let mode_bits = mode.bits() as u32;
++
++        let (raw_mode, major, minor) = match type_ {
++            MknodType::CharDevice(dev_id) => {
++                let major = ((dev_id >> 8) & 0xfff) as u32;
++                let minor = ((dev_id & 0xff) | ((dev_id >> 12) & 0xfff00)) as u32;
++                (S_IFCHR | mode_bits, major, minor)
++            }
++            MknodType::BlockDevice(dev_id) => {
++                let major = ((dev_id >> 8) & 0xfff) as u32;
++                let minor = ((dev_id & 0xff) | ((dev_id >> 12) & 0xfff00)) as u32;
++                (S_IFBLK | mode_bits, major, minor)
++            }
++            MknodType::NamedPipe => (S_IFIFO | mode_bits, 0, 0),
++        };
++
++        device
++            .p9_mknod(self.fid, name, raw_mode, major, minor, 0)
++            .map_err(Error::from)?;
++
++        self.lookup(name)
++    }
++
++    fn link(&self, old: &Arc<dyn Inode>, name: &str) -> Result<()> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::Dir {
++            return_errno_with_message!(Errno::ENOTDIR, "link on non-directory");
++        }
++
++        let old = old
++            .downcast_ref::<Virtio9PInode>()
++            .ok_or_else(|| Error::with_message(Errno::EXDEV, "not same fs"))?;
++
++        let fs = self.fs_ref();
++        fs.fid_mgr
++            .device()
++            .p9_link(self.fid, old.fid, name)
++            .map_err(Error::from)?;
++        Ok(())
++    }
++
++    fn unlink(&self, name: &str) -> Result<()> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::Dir {
++            return_errno_with_message!(Errno::ENOTDIR, "unlink on non-directory");
++        }
++
++        let fs = self.fs_ref();
++        fs.fid_mgr
++            .device()
++            .p9_unlinkat(self.fid, name, 0)
++            .map_err(Error::from)
++    }
++
++    fn rmdir(&self, name: &str) -> Result<()> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::Dir {
++            return_errno_with_message!(Errno::ENOTDIR, "rmdir on non-directory");
++        }
++
++        let fs = self.fs_ref();
++        fs.fid_mgr
++            .device()
++            .p9_unlinkat(self.fid, name, AT_REMOVEDIR)
++            .map_err(Error::from)
++    }
++
++    fn rename(&self, old_name: &str, target: &Arc<dyn Inode>, new_name: &str) -> Result<()> {
++        let target = target
++            .downcast_ref::<Virtio9PInode>()
++            .ok_or_else(|| Error::with_message(Errno::EXDEV, "not same fs"))?;
++
++        let fs = self.fs_ref();
++        fs.fid_mgr
++            .device()
++            .p9_renameat(self.fid, old_name, target.fid, new_name)
++            .map_err(Error::from)
++    }
++
++    fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::Dir {
++            return_errno_with_message!(Errno::ENOTDIR, "readdir on non-directory");
++        }
++
++        let fs = self.fs_ref();
++        // Clone fid, open as directory, read entries, clunk.
++        let dir_fid = fs.fid_mgr.clone_fid(self.fid).map_err(Error::from)?;
++
++        let result = (|| -> Result<usize> {
++            fs.fid_mgr
++                .device()
++                .p9_lopen(dir_fid, O_RDONLY)
++                .map_err(|_| Error::with_message(Errno::EIO, "9p lopen dir failed"))?;
++
++            let entries = fs
++                .fid_mgr
++                .device()
++                .p9_readdir(dir_fid, offset as u64, P9_READDIR_BUF_SIZE)
++                .map_err(|_| Error::with_message(Errno::EIO, "9p readdir failed"))?;
++
++            let mut current_off = offset;
++            for entry in &entries {
++                current_off = entry.offset as usize;
++                visitor.visit(
++                    entry.name.as_str(),
++                    entry.qid.path,
++                    inode_type_from_dirent_type(entry.type_),
++                    current_off,
++                )?;
++            }
++
++            Ok(current_off)
++        })();
++
++        fs.fid_mgr.clunk(dir_fid);
++        result
++    }
++
++    fn read_link(&self) -> Result<SymbolicLink> {
++        let metadata = self.metadata();
++        if metadata.type_ != InodeType::SymLink {
++            return_errno_with_message!(Errno::EINVAL, "read_link on non-symlink");
++        }
++
++        let fs = self.fs_ref();
++        let target = fs
++            .fid_mgr
++            .device()
++            .p9_readlink(self.fid)
++            .map_err(Error::from)?;
++
++        Ok(SymbolicLink::Plain(target))
++    }
++
++    fn sync_data(&self) -> Result<()> {
++        self.flush_page_cache()?;
++        let fs = self.fs_ref();
++        let _ = fs.fid_mgr.device().p9_fsync(self.fid, 1);
++        Ok(())
++    }
++
++    fn sync_all(&self) -> Result<()> {
++        self.flush_page_cache()?;
++        let fs = self.fs_ref();
++        let _ = fs.fid_mgr.device().p9_fsync(self.fid, 0);
++        Ok(())
++    }
++
++    fn fs(&self) -> Arc<dyn FileSystem> {
++        self.fs_ref()
++    }
++
++    fn extension(&self) -> &Extension {
++        &self.extension
++    }
++}
+diff --git a/kernel/src/fs/virtio9p/mod.rs b/kernel/src/fs/virtio9p/mod.rs
+new file mode 100644
+index 000000000..cd52171f6
+--- /dev/null
++++ b/kernel/src/fs/virtio9p/mod.rs
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: MPL-2.0
++
++mod fid;
++mod fs;
++
++pub(super) fn init() {
++    super::registry::register(&fs::Virtio9PFsType).unwrap();
++}
+diff --git a/kernel/src/syscall/mount.rs b/kernel/src/syscall/mount.rs
+index 4cb6c004b..081767282 100644
+--- a/kernel/src/syscall/mount.rs
++++ b/kernel/src/syscall/mount.rs
+@@ -240,8 +240,8 @@ fn open_fs(
+         Some(user_space.read_cstring(data_addr, MAX_FILENAME_LEN)?)
+     };
+ 
+-    if data.is_none()
+-        && fs_type.name() == "virtiofs"
++    if fs_type.name() == "virtiofs"
++        && data.is_none()
+         && let Some(source) = dev_name
+     {
+         data = Some(
+@@ -250,6 +250,18 @@ fn open_fs(
+         );
+     }
+ 
++    // Linux-compatible 9P mount convention: the mount source carries the tag
++    // (`mount -t 9p <tag> <target> -o ...`). Use source as the tag whenever
++    // it is provided, regardless of the option string.
++    if fs_type.name() == "9p"
++        && let Some(source) = dev_name
++    {
++        data = Some(
++            CString::new(source)
++                .map_err(|_| Error::with_message(Errno::EINVAL, "invalid 9p source(tag)"))?,
++        );
++    }
++
+     let disk = if fs_type.properties().contains(FsProperties::NEED_DISK) {
+         let dev_name = dev_name
+             .ok_or_else(|| Error::with_message(Errno::EINVAL, "the source is not specified"))?;
+diff --git a/tools/qemu_args.sh b/tools/qemu_args.sh
+index efba275b4..a0f9ce12d 100755
+--- a/tools/qemu_args.sh
++++ b/tools/qemu_args.sh
+@@ -15,12 +15,18 @@
+ #  - SMP: number of CPUs;
+ #  - MEM: amount of memory, e.g. "8G";
+ #  - VNC_PORT: VNC port, default is "42".
++#  - ENABLE_9P: "0" or "1" to enable virtio-9p device;
++#  - VIRTIO9P_TAG: mount tag for 9p device;
++#  - VIRTIO9P_SHARED_DIR: host directory shared via 9p.
+ 
+ OVMF=${OVMF:-"on"}
+ VHOST=${VHOST:-"off"}
+ VSOCK=${VSOCK:-"off"}
+ NETDEV=${NETDEV:-"user"}
+ CONSOLE=${CONSOLE:-"hvc0"}
++ENABLE_9P=${ENABLE_9P:-"0"}
++VIRTIO9P_TAG=${VIRTIO9P_TAG:-"host0"}
++VIRTIO9P_SHARED_DIR=${VIRTIO9P_SHARED_DIR:-"/tmp/9p_shared"}
+ 
+ SSH_RAND_PORT=${SSH_PORT:-$(shuf -i 1024-65535 -n 1)}
+ NGINX_RAND_PORT=${NGINX_PORT:-$(shuf -i 1024-65535 -n 1)}
+@@ -141,6 +147,25 @@ MICROVM_QEMU_ARGS="\
+     $CONSOLE_ARGS \
+ "
+ 
++if [ "$ENABLE_9P" = "1" ]; then
++    # Create the shared directory if it doesn't exist
++    mkdir -p "$VIRTIO9P_SHARED_DIR" 2>/dev/null
++    echo "[$1] Enabled virtio-9p: tag=$VIRTIO9P_TAG, dir=$VIRTIO9P_SHARED_DIR" 1>&2
++    if [ "$1" = "microvm" ]; then
++        MICROVM_QEMU_ARGS="
++            $MICROVM_QEMU_ARGS \
++            -fsdev local,id=fsdev9p,path=$VIRTIO9P_SHARED_DIR,security_model=mapped-xattr \
++            -device virtio-9p-device,fsdev=fsdev9p,mount_tag=$VIRTIO9P_TAG \
++        "
++    else
++        QEMU_ARGS="
++            $QEMU_ARGS \
++            -fsdev local,id=fsdev9p,path=$VIRTIO9P_SHARED_DIR,security_model=mapped-xattr \
++            -device virtio-9p-pci,fsdev=fsdev9p,mount_tag=$VIRTIO9P_TAG,disable-legacy=on,disable-modern=off$IOMMU_DEV_EXTRA \
++        "
++    fi
++fi
++
+ if [ "$VSOCK" = "on" ]; then
+     # RAND_CID=$(shuf -i 3-65535 -n 1)
+     RAND_CID=3
