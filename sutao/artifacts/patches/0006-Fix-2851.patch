@@ -1,0 +1,168 @@
+From 4024f55c8ceb7e5ccc8acb01f5f0d9cb25b7cb25 Mon Sep 17 00:00:00 2001
+From: Tao Su <st498824@antgroup.com>
+Date: Wed, 25 Mar 2026 01:55:45 +0000
+Subject: [PATCH 6/6] Fix #2851
+
+---
+ distro/etc_nixos/configuration.nix | 11 ++++-
+ kernel/src/fs/file/file_table.rs   | 66 +++++++++++++++++++++---------
+ kernel/src/syscall/fcntl.rs        | 10 ++---
+ 3 files changed, 61 insertions(+), 26 deletions(-)
+
+diff --git a/distro/etc_nixos/configuration.nix b/distro/etc_nixos/configuration.nix
+index fddb1d5b..da7bf586 100644
+--- a/distro/etc_nixos/configuration.nix
++++ b/distro/etc_nixos/configuration.nix
+@@ -24,7 +24,16 @@
+ 
+   # List packages installed in system profile.
+   # You can use https://search.nixos.org/ to find more packages (and options).
+-  environment.systemPackages = with pkgs; [ hello-asterinas vim codex ];
++  environment.systemPackages = with pkgs; [
++    clang
++    codex
++    curl
++    gcc
++    git
++    gnumake
++    hello-asterinas
++    vim
++  ];
+ 
+   system.nixos.distroName = "Asterinas NixOS";
+ 
+diff --git a/kernel/src/fs/file/file_table.rs b/kernel/src/fs/file/file_table.rs
+index 00a97baf..b89fd7dd 100644
+--- a/kernel/src/fs/file/file_table.rs
++++ b/kernel/src/fs/file/file_table.rs
+@@ -3,15 +3,16 @@
+ use core::sync::atomic::{AtomicU8, Ordering};
+ 
+ use aster_util::slot_vec::SlotVec;
++use ostd::sync::RwArc;
+ 
+-use super::{StatusFlags, file_handle::FileLike};
++use super::{file_handle::FileLike, StatusFlags};
+ use crate::{
+     events::{IoEvents, Observer},
+     prelude::*,
+     process::{
+-        Pid, Process,
+         posix_thread::FileTableRefMut,
+-        signal::{PollAdaptor, constants::SIGIO},
++        signal::{constants::SIGIO, PollAdaptor},
++        Pid, Process,
+     },
+ };
+ 
+@@ -252,27 +253,20 @@ impl FileTableEntry {
+         self.owner.as_ref().map(|(pid, _)| *pid)
+     }
+ 
+-    /// Set a process (group) as owner of the file descriptor.
+-    ///
+-    /// Such that this process (group) will receive `SIGIO` and `SIGURG` signals
+-    /// for I/O events on the file descriptor, if `O_ASYNC` status flag is set
+-    /// on this file.
+-    pub fn set_owner(&mut self, owner: Option<&Arc<Process>>) -> Result<()> {
++    fn build_owner(file: Arc<dyn FileLike>, owner: Option<&Arc<Process>>) -> Result<Option<Owner>> {
+         let Some(process) = owner else {
+-            self.owner = None;
+-            return Ok(());
++            return Ok(None);
+         };
+ 
+-        let mut poller = PollAdaptor::with_observer(OwnerObserver::new(
+-            self.file.clone(),
+-            Arc::downgrade(process),
+-        ));
+-        self.file
+-            .poll(IoEvents::IN | IoEvents::OUT, Some(poller.as_handle_mut()));
++        let mut poller =
++            PollAdaptor::with_observer(OwnerObserver::new(file.clone(), Arc::downgrade(process)));
++        file.poll(IoEvents::IN | IoEvents::OUT, Some(poller.as_handle_mut()));
+ 
+-        self.owner = Some((process.pid(), poller));
++        Ok(Some((process.pid(), poller)))
++    }
+ 
+-        Ok(())
++    fn replace_owner(&mut self, owner: Option<Owner>) -> Option<Owner> {
++        core::mem::replace(&mut self.owner, owner)
+     }
+ 
+     pub fn flags(&self) -> FdFlags {
+@@ -321,3 +315,37 @@ impl Observer<IoEvents> for OwnerObserver {
+         }
+     }
+ }
++
++/// Sets the owner of a file descriptor without performing file operations under the file table
++/// write lock.
++pub fn set_file_owner(
++    file_table: &RwArc<FileTable>,
++    fd: FileDesc,
++    owner: Option<&Arc<Process>>,
++) -> Result<()> {
++    loop {
++        let file = {
++            let file_table = file_table.read();
++            file_table.get_entry(fd)?.file().clone()
++        };
++        let mut new_owner = FileTableEntry::build_owner(file.clone(), owner)?;
++
++        let old_owner = {
++            let mut file_table = file_table.write();
++            let file_entry = file_table.get_entry_mut(fd)?;
++            if !Arc::ptr_eq(file_entry.file(), &file) {
++                None
++            } else {
++                Some(file_entry.replace_owner(new_owner.take()))
++            }
++        };
++
++        match old_owner {
++            Some(old_owner) => {
++                drop(old_owner);
++                return Ok(());
++            }
++            None => drop(new_owner),
++        }
++    }
++}
+diff --git a/kernel/src/syscall/fcntl.rs b/kernel/src/syscall/fcntl.rs
+index fd4f0dcd..c092169e 100644
+--- a/kernel/src/syscall/fcntl.rs
++++ b/kernel/src/syscall/fcntl.rs
+@@ -6,14 +6,14 @@ use super::SyscallReturn;
+ use crate::{
+     fs::{
+         file::{
++            file_table::{get_file_fast, set_file_owner, FdFlags, FileDesc, WithFileTable},
+             FileLike, StatusFlags,
+-            file_table::{FdFlags, FileDesc, WithFileTable, get_file_fast},
+         },
+         ramfs::memfd::{FileSeals, MemfdInodeHandle},
+-        vfs::range_lock::{FileRange, OFFSET_MAX, RangeLockItem, RangeLockType},
++        vfs::range_lock::{FileRange, RangeLockItem, RangeLockType, OFFSET_MAX},
+     },
+     prelude::*,
+-    process::{Pid, process_table},
++    process::{process_table, Pid},
+ };
+ 
+ pub fn sys_fcntl(fd: FileDesc, cmd: i32, arg: u64, ctx: &Context) -> Result<SyscallReturn> {
+@@ -155,9 +155,7 @@ fn handle_setown(fd: FileDesc, arg: u64, ctx: &Context) -> Result<SyscallReturn>
+     };
+ 
+     let file_table = ctx.thread_local.borrow_file_table();
+-    let mut file_table_locked = file_table.unwrap().write();
+-    let file_entry = file_table_locked.get_entry_mut(fd)?;
+-    file_entry.set_owner(owner_process.as_ref())?;
++    set_file_owner(file_table.unwrap(), fd, owner_process.as_ref())?;
+     Ok(SyscallReturn::Return(0))
+ }
+ 
+-- 
+2.43.0
+
