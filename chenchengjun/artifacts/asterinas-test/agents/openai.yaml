@@ -1,0 +1,4 @@
+interface:
+  display_name: "Asterinas Test"
+  short_description: "Unified entry for general test listing, runs, and verification"
+  default_prompt: "Use $asterinas-test to list general test targets, run them on Asterinas or Linux, or verify the same target set across Linux and Asterinas with saved logs and focused failure summaries."
