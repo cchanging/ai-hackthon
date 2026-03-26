@@ -1,0 +1,28 @@
+From 061f0ead264dcd300b88f1727226f06bc39f074a Mon Sep 17 00:00:00 2001
+From: Tao Su <st498824@antgroup.com>
+Date: Mon, 23 Mar 2026 08:24:31 +0000
+Subject: [PATCH 2/6] Fix `codex` segmentation fault
+
+---
+ ostd/src/arch/x86/cpu/context/mod.rs | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ostd/src/arch/x86/cpu/context/mod.rs b/ostd/src/arch/x86/cpu/context/mod.rs
+index 4dc439b2..7dcb1c22 100644
+--- a/ostd/src/arch/x86/cpu/context/mod.rs
++++ b/ostd/src/arch/x86/cpu/context/mod.rs
+@@ -604,7 +604,10 @@ impl XSaveArea {
+         // Set the initial values for the FPU context. Refer to Intel SDM, Table 11-1:
+         // "IA-32 and Intel® 64 Processor States Following Power-up, Reset, or INIT (Contd.)".
+         xsave_area.fxsave_area.control = 0x037F;
+-        xsave_area.fxsave_area.tag = 0xFFFF;
++        // In the FXSAVE/XSAVE image this field stores the abridged x87 tag word,
++        // not the legacy 16-bit x87 tag word. `fninit` leaves all x87 registers
++        // empty, which must be encoded as zero here.
++        xsave_area.fxsave_area.tag = 0;
+         xsave_area.fxsave_area.mxcsr = 0x1F80;
+         xsave_area.features = features;
+ 
+-- 
+2.43.0
+

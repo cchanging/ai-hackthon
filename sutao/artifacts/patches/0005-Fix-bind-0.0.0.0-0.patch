@@ -1,0 +1,69 @@
+From 0b65de51b2a20b441bc8faf7361cebd2bb861391 Mon Sep 17 00:00:00 2001
+From: Tao Su <st498824@antgroup.com>
+Date: Tue, 24 Mar 2026 13:18:11 +0000
+Subject: [PATCH 5/6] Fix `bind(0.0.0.0:0)`
+
+---
+ kernel/src/net/socket/ip/common.rs | 32 +++++++++++++++++++++---------
+ 1 file changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/src/net/socket/ip/common.rs b/kernel/src/net/socket/ip/common.rs
+index 5ebfc28e..b6b990db 100644
+--- a/kernel/src/net/socket/ip/common.rs
++++ b/kernel/src/net/socket/ip/common.rs
+@@ -3,7 +3,7 @@
+ use aster_bigtcp::{
+     errors::BindError,
+     iface::BindPortConfig,
+-    wire::{IpAddress, IpEndpoint},
++    wire::{IpAddress, IpEndpoint, Ipv4Address},
+ };
+ 
+ use crate::{
+@@ -24,6 +24,14 @@ pub(super) fn get_iface_to_bind(ip_addr: &IpAddress) -> Option<Arc<Iface>> {
+         .map(Clone::clone)
+ }
+ 
++fn default_bind_iface() -> Arc<Iface> {
++    if let Some(virtio_iface) = virtio_iface() {
++        virtio_iface.clone()
++    } else {
++        loopback_iface().clone()
++    }
++}
++
+ /// Get a suitable iface to deal with sendto/connect request if the socket is not bound to an iface.
+ /// If the remote address is the same as that of some iface, we will use the iface.
+ /// Otherwise, we will use a default interface.
+@@ -49,14 +57,20 @@ fn get_ephemeral_iface(remote_ip_addr: &IpAddress) -> Arc<Iface> {
+ }
+ 
+ pub(super) fn bind_port(endpoint: &IpEndpoint, can_reuse: bool) -> Result<BoundPort> {
+-    let iface = match get_iface_to_bind(&endpoint.addr) {
+-        Some(iface) => iface,
+-        None => {
+-            return_errno_with_message!(
+-                Errno::EADDRNOTAVAIL,
+-                "the address is not available from the local machine"
+-            );
+-        }
++    let iface = match endpoint.addr {
++        // Linux allows binding an IP socket to `INADDR_ANY`. We do not yet track an
++        // iface-independent local endpoint, so fall back to the default iface to
++        // support callers such as musl's DNS resolver.
++        IpAddress::Ipv4(Ipv4Address::UNSPECIFIED) => default_bind_iface(),
++        _ => match get_iface_to_bind(&endpoint.addr) {
++            Some(iface) => iface,
++            None => {
++                return_errno_with_message!(
++                    Errno::EADDRNOTAVAIL,
++                    "the address is not available from the local machine"
++                );
++            }
++        },
+     };
+ 
+     let bind_port_config = BindPortConfig::new(endpoint.port, can_reuse);
+-- 
+2.43.0
+

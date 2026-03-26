@@ -1,0 +1,76 @@
+From 0d59a0dbf844bb43823c2d987fe0ae98968e81c6 Mon Sep 17 00:00:00 2001
+From: Tao Su <st498824@antgroup.com>
+Date: Tue, 24 Mar 2026 07:15:07 +0000
+Subject: [PATCH 4/6] Add `tools/build_codex_musl.sh`
+
+---
+ tools/build_codex_musl.sh | 57 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+ create mode 100755 tools/build_codex_musl.sh
+
+diff --git a/tools/build_codex_musl.sh b/tools/build_codex_musl.sh
+new file mode 100755
+index 00000000..457c7a06
+--- /dev/null
++++ b/tools/build_codex_musl.sh
+@@ -0,0 +1,57 @@
++#!/usr/bin/env bash
++
++set -euo pipefail
++
++repo_root="/root/asterinas"
++codex_dir="$repo_root/codex-src/codex-rs"
++target_triple="x86_64-unknown-linux-musl"
++libcap_pkgconfig_dir="/tmp/codex-musl-tools-$target_triple/libcap-2.75/prefix/lib/pkgconfig"
++output_binary="$codex_dir/target/$target_triple/release/codex"
++
++require_command() {
++    local command_name="$1"
++    if ! command -v "$command_name" >/dev/null 2>&1; then
++        echo "missing required command: $command_name" >&2
++        exit 1
++    fi
++}
++
++require_file() {
++    local path="$1"
++    if [[ ! -e "$path" ]]; then
++        echo "missing required file or directory: $path" >&2
++        exit 1
++    fi
++}
++
++require_command cargo
++require_command rustup
++require_command x86_64-linux-musl-gcc
++require_file "$codex_dir/Cargo.toml"
++require_file "$libcap_pkgconfig_dir"
++
++if ! rustup target list --installed | grep -qx "$target_triple"; then
++    echo "missing rust target: $target_triple" >&2
++    echo "run: rustup target add $target_triple" >&2
++    exit 1
++fi
++
++cd "$codex_dir"
++
++export CC=/usr/bin/x86_64-linux-musl-gcc
++export TARGET_CC=/usr/bin/x86_64-linux-musl-gcc
++export CC_x86_64_unknown_linux_musl=/usr/bin/x86_64-linux-musl-gcc
++export CXX=/usr/bin/x86_64-linux-musl-gcc
++export TARGET_CXX=/usr/bin/x86_64-linux-musl-gcc
++export CXX_x86_64_unknown_linux_musl=/usr/bin/x86_64-linux-musl-gcc
++export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/usr/bin/x86_64-linux-musl-gcc
++export PKG_CONFIG_ALLOW_CROSS=1
++export PKG_CONFIG_PATH="$libcap_pkgconfig_dir"
++export PKG_CONFIG_PATH_x86_64_unknown_linux_musl="$libcap_pkgconfig_dir"
++export CFLAGS='-pthread -idirafter/usr/include -idirafter/usr/include/x86_64-linux-gnu'
++export CXXFLAGS='-pthread -idirafter/usr/include -idirafter/usr/include/x86_64-linux-gnu'
++export AWS_LC_SYS_NO_JITTER_ENTROPY=1
++
++cargo build --release --target "$target_triple" -p codex-cli
++
++echo "built: $output_binary"
+-- 
+2.43.0
+

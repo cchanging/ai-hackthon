@@ -1,0 +1,77 @@
+From dbabf691254533d2c909daa15b6fde49a97bc095 Mon Sep 17 00:00:00 2001
+From: Tao Su <st498824@antgroup.com>
+Date: Tue, 24 Mar 2026 01:46:09 +0000
+Subject: [PATCH 3/6] Overlay codex to local binary
+
+---
+ .../templates/aster_configuration.nix         |  1 +
+ distro/etc_nixos/configuration.nix            |  2 +-
+ distro/etc_nixos/overlays/codex/default.nix   | 31 +++++++++++++++++++
+ 3 files changed, 33 insertions(+), 1 deletion(-)
+ create mode 100644 distro/etc_nixos/overlays/codex/default.nix
+
+diff --git a/distro/aster_nixos_installer/templates/aster_configuration.nix b/distro/aster_nixos_installer/templates/aster_configuration.nix
+index 00c3ae95..676310c3 100644
+--- a/distro/aster_nixos_installer/templates/aster_configuration.nix
++++ b/distro/aster_nixos_installer/templates/aster_configuration.nix
+@@ -28,6 +28,7 @@
+   # For details on the overlay file definition format,
+   # please refer to https://nixos.org/manual/nixpkgs/stable/#sec-overlays-definition.
+   config.nixpkgs.overlays = [
++    (import ./overlays/codex/default.nix)
+     (import ./overlays/desktop/default.nix)
+     (import ./overlays/hello-asterinas/default.nix)
+     (import ./overlays/podman/default.nix)
+diff --git a/distro/etc_nixos/configuration.nix b/distro/etc_nixos/configuration.nix
+index a9f34db4..fddb1d5b 100644
+--- a/distro/etc_nixos/configuration.nix
++++ b/distro/etc_nixos/configuration.nix
+@@ -24,7 +24,7 @@
+ 
+   # List packages installed in system profile.
+   # You can use https://search.nixos.org/ to find more packages (and options).
+-  environment.systemPackages = with pkgs; [ hello-asterinas codex ];
++  environment.systemPackages = with pkgs; [ hello-asterinas vim codex ];
+ 
+   system.nixos.distroName = "Asterinas NixOS";
+ 
+diff --git a/distro/etc_nixos/overlays/codex/default.nix b/distro/etc_nixos/overlays/codex/default.nix
+new file mode 100644
+index 00000000..4ad8e933
+--- /dev/null
++++ b/distro/etc_nixos/overlays/codex/default.nix
+@@ -0,0 +1,31 @@
++final: prev:
++let
++  version = "0.116.0";
++  binary = builtins.path {
++    path = "/root/asterinas/codex-src/codex-rs/target/x86_64-unknown-linux-musl/release/codex";
++    name = "codex-local-binary";
++  };
++in {
++  codex = prev.stdenvNoCC.mkDerivation {
++    pname = "codex";
++    inherit version;
++
++    dontUnpack = true;
++
++    installPhase = ''
++      runHook preInstall
++
++      install -Dm755 ${binary} "$out/bin/codex"
++
++      runHook postInstall
++    '';
++
++    meta = with prev.lib; {
++      description = "OpenAI Codex CLI";
++      homepage = "https://github.com/openai/codex";
++      license = licenses.asl20;
++      mainProgram = "codex";
++      platforms = platforms.linux;
++    };
++  };
++}
+-- 
+2.43.0
+
