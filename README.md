@@ -4,6 +4,7 @@
 
 - chenchengjun
 - chenqingsong
+- sutao
 - wangzhenchen
 - yuxinyi
 - zhangwei
