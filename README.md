@@ -1,4 +1,4 @@
-# Groups 
+# Agent-thon Projects
 
 ### Bug Hunting
 
