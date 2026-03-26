@@ -1,0 +1,4 @@
+interface:
+  display_name: "Asterinas Verify"
+  short_description: "Unified entry for change, syscall, or module verification"
+  default_prompt: "Use $asterinas-verify to verify a change, syscall, or module, split mixed changes into review units when needed, explicitly examine user-space input corner cases, delegate unit-local research and test work to subagents whenever feasible, use targeted tests to confirm uncertain behavior when they provide a crisp oracle, then generate all regression tests and validate them through one final batched Asterinas test run whenever feasible."
