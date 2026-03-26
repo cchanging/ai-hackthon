@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Creator"
+  short_description: "Generate .test plans from specs"
+  default_prompt: "Use $test-creator to turn an existing spec into a standalone `.test` file and validation matrix."

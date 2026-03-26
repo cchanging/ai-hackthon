@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Validator"
+  short_description: "Cross-check spec, test, code"
+  default_prompt: "Use $test-validator to validate whether a `.test` file covers the spec, whether current tests cover the `.test`, and whether the code logic follows it."

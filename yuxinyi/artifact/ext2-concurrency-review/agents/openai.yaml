@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ext2 Concurrency Review"
+  short_description: "Review ext2 feature concurrency"
+  default_prompt: "Use $ext2-concurrency-review to review the full concurrency behavior of the ext2 feature `write_at`."

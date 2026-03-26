@@ -1,0 +1,4 @@
+interface:
+  display_name: "Contract Spec"
+  short_description: "Create stable validation contracts"
+  default_prompt: "Use $contract-spec to draft a stable validation-oriented contract spec for ext2 directory mutation APIs."
