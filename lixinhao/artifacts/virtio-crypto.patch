@@ -1,0 +1,2075 @@
+commit f53b37a65abb8e64f803448bdef80904411eb0aa
+Author: li041 <lxh050013@outlook.com>
+Date:   Wed Mar 25 05:34:10 2026 +0000
+
+    add basic support for virtio-crypto
+
+diff --git a/kernel/comps/virtio/src/device/crypto/config.rs b/kernel/comps/virtio/src/device/crypto/config.rs
+new file mode 100644
+index 000000000..13e8de546
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/crypto/config.rs
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use core::mem::offset_of;
++
++use aster_util::safe_ptr::SafePtr;
++use ostd_pod::FromZeros;
++
++use crate::transport::{ConfigManager, VirtioTransport};
++
++bitflags::bitflags! {
++    pub struct CryptoFeatures: u64 {}
++}
++
++impl CryptoFeatures {
++    pub fn supported_features() -> Self {
++        Self::empty()
++    }
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoConfig {
++    pub status: u32,
++    pub max_dataqueues: u32,
++    pub crypto_services: u32,
++    pub cipher_algo_l: u32,
++    pub cipher_algo_h: u32,
++    pub hash_algo: u32,
++    pub mac_algo_l: u32,
++    pub mac_algo_h: u32,
++    pub aead_algo: u32,
++    pub akcipher_algo: u32,
++}
++
++impl VirtioCryptoConfig {
++    pub(super) fn new_manager(transport: &dyn VirtioTransport) -> ConfigManager<Self> {
++        let safe_ptr = transport
++            .device_config_mem()
++            .map(|mem| SafePtr::new(mem, 0));
++        let bar_space = transport.device_config_bar();
++
++        ConfigManager::new(safe_ptr, bar_space)
++    }
++}
++
++impl ConfigManager<VirtioCryptoConfig> {
++    pub(super) fn read_config(&self) -> VirtioCryptoConfig {
++        let mut config = VirtioCryptoConfig::new_zeroed();
++
++        config.status = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, status))
++            .unwrap();
++        config.max_dataqueues = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, max_dataqueues))
++            .unwrap();
++        config.crypto_services = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, crypto_services))
++            .unwrap();
++        config.cipher_algo_l = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, cipher_algo_l))
++            .unwrap();
++        config.cipher_algo_h = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, cipher_algo_h))
++            .unwrap();
++        config.hash_algo = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, hash_algo))
++            .unwrap();
++        config.mac_algo_l = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, mac_algo_l))
++            .unwrap();
++        config.mac_algo_h = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, mac_algo_h))
++            .unwrap();
++        config.aead_algo = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, aead_algo))
++            .unwrap();
++        config.akcipher_algo = self
++            .read_once::<u32>(offset_of!(VirtioCryptoConfig, akcipher_algo))
++            .unwrap();
++
++        config
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/crypto/device/client.rs b/kernel/comps/virtio/src/device/crypto/device/client.rs
+new file mode 100644
+index 000000000..19b1fc64d
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/crypto/device/client.rs
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use core::mem::size_of;
++
++use ostd::mm::VmIo;
++
++use super::*;
++
++impl CryptoDevice {
++    pub fn create_cipher_session(
++        &self,
++        algo: u32,
++        key: &[u8],
++        _iv_len: u32,
++        op: u32,
++    ) -> Result<u64, VirtioDeviceError> {
++        let request_id = self.alloc_request_id();
++        let session_hint = self.alloc_session_id_hint();
++
++        let req = VirtioCryptoCreateSessionReq {
++            header: Self::build_ctrl_header(VIRTIO_CRYPTO_CIPHER_CREATE_SESSION, algo),
++            para: VirtioCryptoCipherSessionPara {
++                algo,
++                keylen: key.len() as u32,
++                op,
++                padding: 0,
++            },
++            cipher_padding: [0u8; 32],
++            op_type: VIRTIO_CRYPTO_SYM_OP_CIPHER,
++            padding: 0,
++        };
++
++        let req_buf = self.alloc_to_device_buf(size_of::<VirtioCryptoCreateSessionReq>());
++        let req_slice = Slice::new(
++            req_buf.clone(),
++            0..size_of::<VirtioCryptoCreateSessionReq>(),
++        );
++        req_slice.write_val(0, &req).unwrap();
++        req_slice
++            .mem_obj()
++            .sync_to_device(req_slice.offset().clone())
++            .unwrap();
++
++        let key_buf = self.alloc_to_device_buf(key.len());
++        let key_slice = Slice::new(key_buf.clone(), 0..key.len());
++        self.write_bytes_to_buf(&key_buf, key);
++        key_slice
++            .mem_obj()
++            .sync_to_device(key_slice.offset().clone())
++            .unwrap();
++
++        let status_buf = self.alloc_from_device_buf(size_of::<VirtioCryptoSessionInput>());
++        let status_slice = Slice::new(status_buf.clone(), 0..size_of::<VirtioCryptoSessionInput>());
++
++        let submit_res = self.submit_request_and_wait(
++            QueueSelector::Control,
++            request_id,
++            &[&req_slice, &key_slice],
++            &[&status_slice],
++        );
++
++        if submit_res.is_err() {
++            self.dealloc_session_id_hint(session_hint);
++            return submit_res.map(|_| 0);
++        }
++
++        status_slice
++            .mem_obj()
++            .sync_from_device(status_slice.offset().clone())
++            .unwrap();
++        let status: VirtioCryptoSessionInput = status_slice.read_val(0).unwrap();
++
++        if Self::check_ctrl_status(&status).is_err() {
++            self.dealloc_session_id_hint(session_hint);
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++
++        self.dealloc_session_id_hint(session_hint);
++
++        Ok(status.session_id)
++    }
++
++    pub fn close_cipher_session(
++        &self,
++        _algo: u32,
++        session_id: u64,
++    ) -> Result<(), VirtioDeviceError> {
++        let request_id = self.alloc_request_id();
++
++        let req = VirtioCryptoDestroySessionReq {
++            header: Self::build_ctrl_header(VIRTIO_CRYPTO_CIPHER_DESTROY_SESSION, 0),
++            session_id,
++            padding: [0u8; 48],
++        };
++
++        let req_buf = self.alloc_to_device_buf(size_of::<VirtioCryptoDestroySessionReq>());
++        let req_slice = Slice::new(
++            req_buf.clone(),
++            0..size_of::<VirtioCryptoDestroySessionReq>(),
++        );
++        req_slice.write_val(0, &req).unwrap();
++        req_slice
++            .mem_obj()
++            .sync_to_device(req_slice.offset().clone())
++            .unwrap();
++
++        let status_buf = self.alloc_from_device_buf(size_of::<VirtioCryptoInHdr>());
++        let status_slice = Slice::new(status_buf.clone(), 0..size_of::<VirtioCryptoInHdr>());
++
++        self.submit_request_and_wait(
++            QueueSelector::Control,
++            request_id,
++            &[&req_slice],
++            &[&status_slice],
++        )?;
++
++        status_slice
++            .mem_obj()
++            .sync_from_device(status_slice.offset().clone())
++            .unwrap();
++        let status: VirtioCryptoInHdr = status_slice.read_val(0).unwrap();
++        Self::check_inhdr_status(status.status)
++    }
++
++    pub fn encrypt(
++        &self,
++        algo: u32,
++        session_id: u64,
++        iv: &[u8],
++        plaintext: &[u8],
++    ) -> Result<Vec<u8>, VirtioDeviceError> {
++        self.crypto_op(
++            VIRTIO_CRYPTO_CIPHER_ENCRYPT,
++            algo,
++            session_id,
++            iv,
++            plaintext,
++        )
++    }
++
++    pub fn decrypt(
++        &self,
++        algo: u32,
++        session_id: u64,
++        iv: &[u8],
++        ciphertext: &[u8],
++    ) -> Result<Vec<u8>, VirtioDeviceError> {
++        self.crypto_op(
++            VIRTIO_CRYPTO_CIPHER_DECRYPT,
++            algo,
++            session_id,
++            iv,
++            ciphertext,
++        )
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/crypto/device/mod.rs b/kernel/comps/virtio/src/device/crypto/device/mod.rs
+new file mode 100644
+index 000000000..3dd9f82b0
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/crypto/device/mod.rs
+@@ -0,0 +1,474 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
++use core::{cmp, hint::spin_loop, mem::size_of};
++
++use aster_util::mem_obj_slice::Slice;
++use log::{debug, info};
++use ostd::{
++    arch::trap::TrapFrame,
++    mm::{HasSize, VmIo, VmReader, VmWriter, io_util::HasVmReaderWriter},
++    sync::{LocalIrqDisabled, SpinLock, Waiter, Waker},
++    timer::{Jiffies, TIMER_FREQ},
++};
++use spin::Once;
++
++use super::{
++    DEVICE_NAME,
++    config::{CryptoFeatures, VirtioCryptoConfig},
++    pool::{CryptoDmaBuf, CryptoDmaPools},
++    protocol::*,
++};
++use crate::{
++    device::VirtioDeviceError,
++    id_alloc::SyncIdAlloc,
++    queue::{QueueError, VirtQueue},
++    transport::{VirtioTransport, VirtioTransportError},
++};
++
++const DATAQ_INDEX: u16 = 0;
++const CONTROLQ_INDEX: u16 = 1;
++const DEFAULT_QUEUE_SIZE: u16 = 128;
++const REQUEST_ID_ALLOC_CAPACITY: usize = 4096;
++const SESSION_ID_ALLOC_CAPACITY: usize = 4096;
++const REQUEST_WAIT_TIMEOUT_JIFFIES: u64 = 10 * TIMER_FREQ;
++
++static CRYPTO_DEVICES: Once<SpinLock<Vec<Arc<CryptoDevice>>>> = Once::new();
++
++struct RequestWaitState {
++    completed: bool,
++    waker: Option<Arc<Waker>>,
++}
++
++struct CryptoQueue {
++    queue: SpinLock<VirtQueue, LocalIrqDisabled>,
++    pending_requests: SpinLock<BTreeMap<u16, usize>>,
++    request_states: SpinLock<BTreeMap<usize, RequestWaitState>>,
++}
++
++impl CryptoQueue {
++    fn new(queue: VirtQueue) -> Self {
++        Self {
++            queue: SpinLock::new(queue),
++            pending_requests: SpinLock::new(BTreeMap::new()),
++            request_states: SpinLock::new(BTreeMap::new()),
++        }
++    }
++}
++
++impl core::fmt::Debug for CryptoQueue {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("CryptoQueue")
++            .field("queue", &self.queue)
++            .field(
++                "pending_requests_len",
++                &self.pending_requests.disable_irq().lock().len(),
++            )
++            .field(
++                "request_states_len",
++                &self.request_states.disable_irq().lock().len(),
++            )
++            .finish()
++    }
++}
++
++#[derive(Debug, Clone, Copy)]
++enum QueueSelector {
++    Control,
++    Data,
++}
++
++pub struct CryptoDevice {
++    transport: SpinLock<Box<dyn VirtioTransport>, LocalIrqDisabled>,
++    config: VirtioCryptoConfig,
++    control_queue: CryptoQueue,
++    data_queue: CryptoQueue,
++    dma_pools: Arc<CryptoDmaPools>,
++    request_id_alloc: SyncIdAlloc,
++    session_id_alloc: SyncIdAlloc,
++}
++
++impl core::fmt::Debug for CryptoDevice {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("CryptoDevice")
++            .field("transport", &self.transport)
++            .field("config", &self.config)
++            .field("control_queue", &self.control_queue)
++            .field("data_queue", &self.data_queue)
++            .finish()
++    }
++}
++
++mod client;
++mod virtio_ops;
++
++pub fn get_default_device() -> Option<Arc<CryptoDevice>> {
++    let devices = CRYPTO_DEVICES.get()?;
++    devices.disable_irq().lock().first().cloned()
++}
++
++fn config_space_change(_: &TrapFrame) {
++    debug!("Virtio-Crypto device configuration space change");
++}
++
++fn map_transport_err(_: VirtioTransportError) -> VirtioDeviceError {
++    VirtioDeviceError::QueueUnknownError
++}
++
++impl CryptoDevice {
++    pub fn supports_cipher_service(&self) -> bool {
++        self.config.crypto_services & VIRTIO_CRYPTO_SERVICE_CIPHER_MASK != 0
++    }
++
++    pub fn max_dataqueues(&self) -> u32 {
++        self.config.max_dataqueues
++    }
++
++    fn queue(&self, selector: QueueSelector) -> &CryptoQueue {
++        match selector {
++            QueueSelector::Control => &self.control_queue,
++            QueueSelector::Data => &self.data_queue,
++        }
++    }
++
++    fn alloc_to_device_buf(&self, size: usize) -> CryptoDmaBuf {
++        self.dma_pools.alloc_to_device(size)
++    }
++
++    fn alloc_from_device_buf(&self, size: usize) -> CryptoDmaBuf {
++        self.dma_pools.alloc_from_device(size)
++    }
++
++    fn alloc_request_id(&self) -> u64 {
++        self.request_id_alloc.alloc() as u64
++    }
++
++    fn alloc_session_id_hint(&self) -> u64 {
++        self.session_id_alloc.alloc() as u64
++    }
++
++    fn dealloc_session_id_hint(&self, session_id: u64) {
++        let index = session_id as usize;
++        if index < SESSION_ID_ALLOC_CAPACITY {
++            self.session_id_alloc.dealloc(index);
++        }
++    }
++
++    fn submit_request(
++        &self,
++        selector: QueueSelector,
++        request_id: u64,
++        in_slices: &[&Slice<CryptoDmaBuf>],
++        out_slices: &[&Slice<CryptoDmaBuf>],
++    ) -> Result<(), VirtioDeviceError> {
++        let queue = self.queue(selector);
++
++        {
++            let mut virt_queue = queue.queue.lock();
++            let token = virt_queue.add_dma_buf(in_slices, out_slices)?;
++            queue
++                .pending_requests
++                .disable_irq()
++                .lock()
++                .insert(token, request_id as usize);
++
++            if virt_queue.should_notify() {
++                virt_queue.notify();
++            }
++        }
++
++        Ok(())
++    }
++
++    fn submit_request_and_wait(
++        &self,
++        selector: QueueSelector,
++        request_id: u64,
++        in_slices: &[&Slice<CryptoDmaBuf>],
++        out_slices: &[&Slice<CryptoDmaBuf>],
++    ) -> Result<(), VirtioDeviceError> {
++        self.submit_request(selector, request_id, in_slices, out_slices)?;
++        self.wait_for_request(selector, request_id as usize)
++    }
++
++    fn handle_queue_irq(&self, selector: QueueSelector) {
++        let queue_state = self.queue(selector);
++        loop {
++            let pop_result = {
++                let mut queue = queue_state.queue.lock();
++                queue.pop_used()
++            };
++
++            let (token, _) = match pop_result {
++                Ok(completed) => completed,
++                Err(QueueError::NotReady) => break,
++                Err(_) => break,
++            };
++
++            let pending = queue_state
++                .pending_requests
++                .disable_irq()
++                .lock()
++                .remove(&token);
++
++            let Some(pending) = pending else {
++                continue;
++            };
++
++            let mut request_states = queue_state.request_states.disable_irq().lock();
++            let request_state = request_states.entry(pending).or_insert(RequestWaitState {
++                completed: false,
++                waker: None,
++            });
++            request_state.completed = true;
++
++            if let Some(waker) = request_state.waker.take() {
++                let _ = waker.wake_up();
++            }
++        }
++    }
++
++    fn wait_for_request(
++        &self,
++        selector: QueueSelector,
++        request_id: usize,
++    ) -> Result<(), VirtioDeviceError> {
++        let queue_state = self.queue(selector);
++
++        {
++            let mut request_states = queue_state.request_states.disable_irq().lock();
++            if let Some(state) = request_states.get(&request_id)
++                && state.completed
++            {
++                request_states.remove(&request_id);
++                self.request_id_alloc.dealloc(request_id);
++                return Ok(());
++            }
++        }
++
++        let (waiter, waker) = Waiter::new_pair();
++        {
++            let mut request_states = queue_state.request_states.disable_irq().lock();
++            let state = request_states
++                .entry(request_id)
++                .or_insert(RequestWaitState {
++                    completed: false,
++                    waker: None,
++                });
++            if state.completed {
++                request_states.remove(&request_id);
++                self.request_id_alloc.dealloc(request_id);
++                return Ok(());
++            }
++            state.waker = Some(waker);
++        }
++
++        let timeout_deadline = Jiffies::elapsed()
++            .as_u64()
++            .saturating_add(REQUEST_WAIT_TIMEOUT_JIFFIES);
++
++        let wait_res = waiter.wait_until_or_cancelled(
++            || {
++                let mut request_states = queue_state.request_states.disable_irq().lock();
++                if let Some(state) = request_states.get(&request_id)
++                    && state.completed
++                {
++                    request_states.remove(&request_id);
++                    return Some(());
++                }
++                None
++            },
++            || {
++                if Jiffies::elapsed().as_u64() >= timeout_deadline {
++                    Err(())
++                } else {
++                    Ok(())
++                }
++            },
++        );
++
++        if wait_res.is_ok() {
++            self.request_id_alloc.dealloc(request_id);
++            return Ok(());
++        }
++
++        let mut request_states = queue_state.request_states.disable_irq().lock();
++        if let Some(state) = request_states.get_mut(&request_id) {
++            state.waker = None;
++        }
++        request_states.remove(&request_id);
++        self.request_id_alloc.dealloc(request_id);
++
++        Err(VirtioDeviceError::QueueUnknownError)
++    }
++
++    fn wait_for_request_early(
++        &self,
++        selector: QueueSelector,
++        request_id: usize,
++    ) -> Result<(), VirtioDeviceError> {
++        let queue_state = self.queue(selector);
++
++        loop {
++            self.handle_queue_irq(selector);
++
++            let mut request_states = queue_state.request_states.disable_irq().lock();
++            if let Some(state) = request_states.get(&request_id)
++                && state.completed
++            {
++                request_states.remove(&request_id);
++                self.request_id_alloc.dealloc(request_id);
++                return Ok(());
++            }
++
++            spin_loop();
++        }
++    }
++
++    fn write_bytes_to_buf(&self, buf: &CryptoDmaBuf, data: &[u8]) {
++        if data.is_empty() {
++            return;
++        }
++
++        {
++            let mut writer = buf.writer().unwrap();
++            let mut reader = VmReader::from(data);
++            let _ = writer.write(&mut reader);
++        }
++    }
++
++    fn read_bytes_from_slice(&self, slice: &Slice<CryptoDmaBuf>) -> Vec<u8> {
++        let mut data = vec![0u8; slice.size()];
++        {
++            let mut reader = slice.reader().unwrap();
++            reader.read(&mut VmWriter::from(data.as_mut_slice()));
++        }
++        data
++    }
++
++    fn check_ctrl_status(status: &VirtioCryptoSessionInput) -> Result<(), VirtioDeviceError> {
++        if status.status == VIRTIO_CRYPTO_OK {
++            return Ok(());
++        }
++
++        let _ = VirtioCryptoStatus::try_from(status.status);
++        Err(VirtioDeviceError::QueueUnknownError)
++    }
++
++    fn check_inhdr_status(status: u8) -> Result<(), VirtioDeviceError> {
++        if status as u32 == VIRTIO_CRYPTO_OK {
++            return Ok(());
++        }
++
++        let _ = VirtioCryptoStatus::try_from(status as u32);
++        Err(VirtioDeviceError::QueueUnknownError)
++    }
++
++    fn check_data_status(status: &VirtioCryptoDataStatus) -> Result<(), VirtioDeviceError> {
++        Self::check_inhdr_status(status.status)
++    }
++
++    fn new_queue(
++        index: u16,
++        transport: &mut dyn VirtioTransport,
++    ) -> Result<VirtQueue, VirtioDeviceError> {
++        let max_queue_size = transport.max_queue_size(index).map_err(map_transport_err)?;
++        let queue_size = cmp::min(DEFAULT_QUEUE_SIZE, max_queue_size);
++        if queue_size == 0 {
++            return Err(VirtioDeviceError::QueueUnknownError);
++        }
++        VirtQueue::new(index, queue_size, transport).map_err(Into::into)
++    }
++
++    fn build_ctrl_header(opcode: u32, algo: u32) -> VirtioCryptoCtrlHeader {
++        VirtioCryptoCtrlHeader {
++            opcode,
++            algo,
++            flag: 0,
++            queue_id: 0,
++        }
++    }
++
++    fn build_data_header(opcode: u32, algo: u32, session_id: u64) -> VirtioCryptoOpHeader {
++        VirtioCryptoOpHeader {
++            opcode,
++            algo,
++            session_id,
++            flag: 0,
++            padding: 0,
++        }
++    }
++
++    fn crypto_op(
++        &self,
++        opcode: u32,
++        algo: u32,
++        session_id: u64,
++        iv: &[u8],
++        input: &[u8],
++    ) -> Result<Vec<u8>, VirtioDeviceError> {
++        let request_id = self.alloc_request_id();
++
++        let req = VirtioCryptoCipherDataReq {
++            header: Self::build_data_header(opcode, algo, session_id),
++            iv_len: iv.len() as u32,
++            src_len: input.len() as u32,
++            dst_len: input.len() as u32,
++            para_padding: 0,
++            cipher_padding: [0u8; 24],
++            op_type: VIRTIO_CRYPTO_SYM_OP_CIPHER,
++            req_padding: 0,
++        };
++
++        let req_buf = self.alloc_to_device_buf(size_of::<VirtioCryptoCipherDataReq>());
++        let req_slice = Slice::new(req_buf.clone(), 0..size_of::<VirtioCryptoCipherDataReq>());
++        req_slice.write_val(0, &req).unwrap();
++        req_slice
++            .mem_obj()
++            .sync_to_device(req_slice.offset().clone())
++            .unwrap();
++
++        let iv_buf = self.alloc_to_device_buf(iv.len());
++        let iv_slice = Slice::new(iv_buf.clone(), 0..iv.len());
++        self.write_bytes_to_buf(&iv_buf, iv);
++        iv_slice
++            .mem_obj()
++            .sync_to_device(iv_slice.offset().clone())
++            .unwrap();
++
++        let input_buf = self.alloc_to_device_buf(input.len());
++        let input_slice = Slice::new(input_buf.clone(), 0..input.len());
++        self.write_bytes_to_buf(&input_buf, input);
++        input_slice
++            .mem_obj()
++            .sync_to_device(input_slice.offset().clone())
++            .unwrap();
++
++        let output_buf = self.alloc_from_device_buf(input.len());
++        let output_slice = Slice::new(output_buf.clone(), 0..input.len());
++
++        let status_buf = self.alloc_from_device_buf(size_of::<VirtioCryptoDataStatus>());
++        let status_slice = Slice::new(status_buf.clone(), 0..size_of::<VirtioCryptoDataStatus>());
++
++        self.submit_request_and_wait(
++            QueueSelector::Data,
++            request_id,
++            &[&req_slice, &iv_slice, &input_slice],
++            &[&output_slice, &status_slice],
++        )?;
++
++        status_slice
++            .mem_obj()
++            .sync_from_device(status_slice.offset().clone())
++            .unwrap();
++        let status: VirtioCryptoDataStatus = status_slice.read_val(0).unwrap();
++        Self::check_data_status(&status)?;
++
++        output_slice
++            .mem_obj()
++            .sync_from_device(output_slice.offset().clone())
++            .unwrap();
++
++        Ok(self.read_bytes_from_slice(&output_slice))
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/crypto/device/virtio_ops.rs b/kernel/comps/virtio/src/device/crypto/device/virtio_ops.rs
+new file mode 100644
+index 000000000..64351fa48
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/crypto/device/virtio_ops.rs
+@@ -0,0 +1,142 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use core::mem::size_of;
++
++use ostd::mm::VmIo;
++
++use super::*;
++
++impl CryptoDevice {
++    pub fn negotiate_features(features: u64) -> u64 {
++        let device_features = CryptoFeatures::from_bits_truncate(features);
++        let supported_features = CryptoFeatures::supported_features();
++        let crypto_features = device_features & supported_features;
++        debug!("crypto features negotiated: {:?}", crypto_features);
++        crypto_features.bits()
++    }
++
++    pub fn init(mut transport: Box<dyn VirtioTransport>) -> Result<(), VirtioDeviceError> {
++        let config_manager = VirtioCryptoConfig::new_manager(transport.as_ref());
++        let config = config_manager.read_config();
++
++        let total_queues = transport.num_queues();
++        if total_queues < 2 {
++            return Err(VirtioDeviceError::QueuesAmountDoNotMatch(total_queues, 2));
++        }
++
++        let control_queue = CryptoQueue::new(Self::new_queue(CONTROLQ_INDEX, transport.as_mut())?);
++        let data_queue = CryptoQueue::new(Self::new_queue(DATAQ_INDEX, transport.as_mut())?);
++
++        let device = Arc::new(Self {
++            transport: SpinLock::new(transport),
++            config,
++            control_queue,
++            data_queue,
++            dma_pools: CryptoDmaPools::new(),
++            request_id_alloc: SyncIdAlloc::with_capacity(REQUEST_ID_ALLOC_CAPACITY),
++            session_id_alloc: SyncIdAlloc::with_capacity(SESSION_ID_ALLOC_CAPACITY),
++        });
++
++        let mut transport = device.transport.lock();
++        transport
++            .register_cfg_callback(Box::new(config_space_change))
++            .unwrap();
++
++        let control_device = device.clone();
++        let control_wakeup = move |_: &TrapFrame| {
++            control_device.handle_queue_irq(QueueSelector::Control);
++        };
++        transport
++            .register_queue_callback(CONTROLQ_INDEX, Box::new(control_wakeup), false)
++            .unwrap();
++
++        let data_device = device.clone();
++        let data_wakeup = move |_: &TrapFrame| {
++            data_device.handle_queue_irq(QueueSelector::Data);
++        };
++        transport
++            .register_queue_callback(DATAQ_INDEX, Box::new(data_wakeup), false)
++            .unwrap();
++
++        transport.finish_init();
++        drop(transport);
++
++        CRYPTO_DEVICES
++            .call_once(|| SpinLock::new(Vec::new()))
++            .disable_irq()
++            .lock()
++            .push(device.clone());
++
++        info!(
++            "{} initialized, max_dataqueues={}, services={:#x}",
++            DEVICE_NAME,
++            device.max_dataqueues(),
++            device.config.crypto_services
++        );
++
++        Ok(())
++    }
++
++    pub fn create_cipher_session_early(
++        &self,
++        algo: u32,
++        key: &[u8],
++        _iv_len: u32,
++        op: u32,
++    ) -> Result<u64, VirtioDeviceError> {
++        let request_id = self.alloc_request_id();
++
++        let req = VirtioCryptoCreateSessionReq {
++            header: Self::build_ctrl_header(VIRTIO_CRYPTO_CIPHER_CREATE_SESSION, algo),
++            para: VirtioCryptoCipherSessionPara {
++                algo,
++                keylen: key.len() as u32,
++                op,
++                padding: 0,
++            },
++            cipher_padding: [0u8; 32],
++            op_type: VIRTIO_CRYPTO_SYM_OP_CIPHER,
++            padding: 0,
++        };
++
++        let req_buf = self.alloc_to_device_buf(size_of::<VirtioCryptoCreateSessionReq>());
++        let req_slice = Slice::new(
++            req_buf.clone(),
++            0..size_of::<VirtioCryptoCreateSessionReq>(),
++        );
++        req_slice.write_val(0, &req).unwrap();
++        req_slice
++            .mem_obj()
++            .sync_to_device(req_slice.offset().clone())
++            .unwrap();
++
++        let key_buf = self.alloc_to_device_buf(key.len());
++        let key_slice = Slice::new(key_buf.clone(), 0..key.len());
++        self.write_bytes_to_buf(&key_buf, key);
++        key_slice
++            .mem_obj()
++            .sync_to_device(key_slice.offset().clone())
++            .unwrap();
++
++        let status_buf = self.alloc_from_device_buf(size_of::<VirtioCryptoSessionInput>());
++        let status_slice = Slice::new(status_buf.clone(), 0..size_of::<VirtioCryptoSessionInput>());
++
++        self.submit_request(
++            QueueSelector::Control,
++            request_id,
++            &[&req_slice, &key_slice],
++            &[&status_slice],
++        )?;
++        self.wait_for_request_early(QueueSelector::Control, request_id as usize)?;
++
++        status_slice
++            .mem_obj()
++            .sync_from_device(status_slice.offset().clone())
++            .unwrap();
++
++        let status: VirtioCryptoSessionInput = status_slice.read_val(0).unwrap();
++        Self::check_ctrl_status(&status)?;
++
++        Ok(status.session_id)
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/crypto/mod.rs b/kernel/comps/virtio/src/device/crypto/mod.rs
+new file mode 100644
+index 000000000..3e3caba4a
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/crypto/mod.rs
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: MPL-2.0
++
++pub mod config;
++pub mod device;
++pub mod pool;
++pub mod protocol;
++
++pub const DEVICE_NAME: &str = "Virtio-Crypto";
+diff --git a/kernel/comps/virtio/src/device/crypto/pool.rs b/kernel/comps/virtio/src/device/crypto/pool.rs
+new file mode 100644
+index 000000000..926e8b405
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/crypto/pool.rs
+@@ -0,0 +1,181 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use alloc::{collections::BTreeMap, sync::Arc};
++use core::ops::Range;
++
++use aster_network::{DmaSegment, dma_pool::DmaPool};
++use aster_util::mem_obj_slice::Slice;
++use ostd::{
++    Result,
++    mm::{
++        HasDaddr, HasSize, Infallible, PAGE_SIZE, VmReader, VmWriter,
++        dma::{DmaStream, FromDevice, ToDevice},
++        io_util::{HasVmReaderWriter, VmReaderWriterResult},
++    },
++    sync::SpinLock,
++};
++
++use crate::dma_buf::DmaBuf;
++
++const SIZE_CLASSES: &[usize] = &[64, 128, 256, 512, 1024, 2048, 4096];
++const POOL_INIT_SIZE: usize = 8;
++const POOL_HIGH_WATERMARK: usize = 64;
++
++#[derive(Debug)]
++pub struct CryptoDmaPools {
++    to_device_pools: SpinLock<BTreeMap<usize, Arc<DmaPool<ToDevice>>>>,
++    from_device_pools: SpinLock<BTreeMap<usize, Arc<DmaPool<FromDevice>>>>,
++}
++
++impl CryptoDmaPools {
++    pub fn new() -> Arc<Self> {
++        let mut to_device_pools = BTreeMap::new();
++        let mut from_device_pools = BTreeMap::new();
++        for &class in SIZE_CLASSES {
++            to_device_pools.insert(
++                class,
++                DmaPool::<ToDevice>::new(class, POOL_INIT_SIZE, POOL_HIGH_WATERMARK, false),
++            );
++            from_device_pools.insert(
++                class,
++                DmaPool::<FromDevice>::new(class, POOL_INIT_SIZE, POOL_HIGH_WATERMARK, false),
++            );
++        }
++
++        Arc::new(Self {
++            to_device_pools: SpinLock::new(to_device_pools),
++            from_device_pools: SpinLock::new(from_device_pools),
++        })
++    }
++
++    pub fn alloc_to_device(self: &Arc<Self>, required_len: usize) -> CryptoDmaBuf {
++        let class = SIZE_CLASSES.iter().find(|&&size| size >= required_len);
++
++        let storage = if let Some(class_size) = class {
++            let pool = self
++                .to_device_pools
++                .disable_irq()
++                .lock()
++                .get(&class_size)
++                .unwrap()
++                .clone();
++            CryptoDmaStorage::ToSegment(pool.alloc_segment().unwrap())
++        } else {
++            CryptoDmaStorage::Stream(Arc::new(
++                DmaStream::alloc(required_len.div_ceil(PAGE_SIZE), false).unwrap(),
++            ))
++        };
++
++        CryptoDmaBuf {
++            storage: Arc::new(storage),
++            required_len,
++        }
++    }
++
++    pub fn alloc_from_device(self: &Arc<Self>, required_len: usize) -> CryptoDmaBuf {
++        let class = SIZE_CLASSES.iter().find(|&&size| size >= required_len);
++
++        let storage = if let Some(class_size) = class {
++            let pool = self
++                .from_device_pools
++                .disable_irq()
++                .lock()
++                .get(&class_size)
++                .unwrap()
++                .clone();
++            CryptoDmaStorage::FromSegment(pool.alloc_segment().unwrap())
++        } else {
++            CryptoDmaStorage::Stream(Arc::new(
++                DmaStream::alloc(required_len.div_ceil(PAGE_SIZE), false).unwrap(),
++            ))
++        };
++
++        CryptoDmaBuf {
++            storage: Arc::new(storage),
++            required_len,
++        }
++    }
++}
++
++#[derive(Debug)]
++enum CryptoDmaStorage {
++    ToSegment(DmaSegment<ToDevice>),
++    FromSegment(DmaSegment<FromDevice>),
++    Stream(Arc<DmaStream>),
++}
++
++#[derive(Debug, Clone)]
++pub struct CryptoDmaBuf {
++    storage: Arc<CryptoDmaStorage>,
++    required_len: usize,
++}
++
++impl CryptoDmaBuf {
++    pub fn sync_from_device(&self, byte_range: Range<usize>) -> Result<()> {
++        match self.storage.as_ref() {
++            CryptoDmaStorage::ToSegment(_) => Ok(()),
++            CryptoDmaStorage::FromSegment(segment) => segment.sync_from_device(byte_range),
++            CryptoDmaStorage::Stream(stream) => stream.sync_from_device(byte_range),
++        }
++    }
++
++    pub fn sync_to_device(&self, byte_range: Range<usize>) -> Result<()> {
++        match self.storage.as_ref() {
++            CryptoDmaStorage::ToSegment(segment) => segment.sync_to_device(byte_range),
++            CryptoDmaStorage::FromSegment(_) => Ok(()),
++            CryptoDmaStorage::Stream(stream) => stream.sync_to_device(byte_range),
++        }
++    }
++}
++
++impl HasSize for CryptoDmaBuf {
++    fn size(&self) -> usize {
++        self.required_len
++    }
++}
++
++impl HasDaddr for CryptoDmaBuf {
++    fn daddr(&self) -> ostd::mm::Daddr {
++        match self.storage.as_ref() {
++            CryptoDmaStorage::ToSegment(segment) => segment.daddr(),
++            CryptoDmaStorage::FromSegment(segment) => segment.daddr(),
++            CryptoDmaStorage::Stream(stream) => stream.daddr(),
++        }
++    }
++}
++
++impl HasVmReaderWriter for CryptoDmaBuf {
++    type Types = VmReaderWriterResult;
++
++    fn reader(&self) -> ostd::prelude::Result<VmReader<'_, Infallible>> {
++        let mut reader = match self.storage.as_ref() {
++            CryptoDmaStorage::ToSegment(segment) => segment.reader()?,
++            CryptoDmaStorage::FromSegment(segment) => segment.reader()?,
++            CryptoDmaStorage::Stream(stream) => stream.reader()?,
++        };
++        reader.limit(self.required_len);
++        Ok(reader)
++    }
++
++    fn writer(&self) -> ostd::prelude::Result<VmWriter<'_, Infallible>> {
++        let mut writer = match self.storage.as_ref() {
++            CryptoDmaStorage::ToSegment(segment) => segment.writer()?,
++            CryptoDmaStorage::FromSegment(segment) => segment.writer()?,
++            CryptoDmaStorage::Stream(stream) => stream.writer()?,
++        };
++        writer.limit(self.required_len);
++        Ok(writer)
++    }
++}
++
++impl DmaBuf for CryptoDmaBuf {
++    fn len(&self) -> usize {
++        self.size()
++    }
++}
++
++impl DmaBuf for Slice<CryptoDmaBuf> {
++    fn len(&self) -> usize {
++        self.size()
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/crypto/protocol.rs b/kernel/comps/virtio/src/device/crypto/protocol.rs
+new file mode 100644
+index 000000000..4e23dc5a2
+--- /dev/null
++++ b/kernel/comps/virtio/src/device/crypto/protocol.rs
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use int_to_c_enum::TryFromInt;
++
++pub const VIRTIO_CRYPTO_SERVICE_CIPHER: u32 = 0;
++pub const VIRTIO_CRYPTO_SERVICE_CIPHER_MASK: u32 = 1 << VIRTIO_CRYPTO_SERVICE_CIPHER;
++
++const fn virtio_crypto_opcode(service: u32, op: u32) -> u32 {
++    (service << 8) | op
++}
++
++pub const VIRTIO_CRYPTO_OK: u32 = 0;
++
++pub const VIRTIO_CRYPTO_CIPHER_CREATE_SESSION: u32 =
++    virtio_crypto_opcode(VIRTIO_CRYPTO_SERVICE_CIPHER, 0x02);
++pub const VIRTIO_CRYPTO_CIPHER_DESTROY_SESSION: u32 =
++    virtio_crypto_opcode(VIRTIO_CRYPTO_SERVICE_CIPHER, 0x03);
++pub const VIRTIO_CRYPTO_CIPHER_ENCRYPT: u32 =
++    virtio_crypto_opcode(VIRTIO_CRYPTO_SERVICE_CIPHER, 0x00);
++pub const VIRTIO_CRYPTO_CIPHER_DECRYPT: u32 =
++    virtio_crypto_opcode(VIRTIO_CRYPTO_SERVICE_CIPHER, 0x01);
++
++pub const VIRTIO_CRYPTO_SYM_OP_CIPHER: u32 = 1;
++pub const VIRTIO_CRYPTO_OP_ENCRYPT: u32 = 1;
++pub const VIRTIO_CRYPTO_OP_DECRYPT: u32 = 2;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromInt)]
++#[repr(u32)]
++pub enum VirtioCryptoStatus {
++    Ok = 0,
++    Err = 1,
++    BadMsg = 2,
++    NotSupp = 3,
++    InvParam = 4,
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoCtrlHeader {
++    pub opcode: u32,
++    pub algo: u32,
++    pub flag: u32,
++    pub queue_id: u32,
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoOpHeader {
++    pub opcode: u32,
++    pub algo: u32,
++    pub session_id: u64,
++    pub flag: u32,
++    pub padding: u32,
++}
++
++#[allow(non_camel_case_types)]
++pub type virtio_crypto_hdr = VirtioCryptoOpHeader;
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoSessionInput {
++    pub session_id: u64,
++    pub status: u32,
++    pub padding: u32,
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoCipherSessionPara {
++    pub algo: u32,
++    pub keylen: u32,
++    pub op: u32,
++    pub padding: u32,
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoCreateSessionReq {
++    pub header: VirtioCryptoCtrlHeader,
++    pub para: VirtioCryptoCipherSessionPara,
++    pub cipher_padding: [u8; 32],
++    pub op_type: u32,
++    pub padding: u32,
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoDestroySessionReq {
++    pub header: VirtioCryptoCtrlHeader,
++    pub session_id: u64,
++    pub padding: [u8; 48],
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoCipherDataReq {
++    pub header: VirtioCryptoOpHeader,
++    pub iv_len: u32,
++    pub src_len: u32,
++    pub dst_len: u32,
++    pub para_padding: u32,
++    pub cipher_padding: [u8; 24],
++    pub op_type: u32,
++    pub req_padding: u32,
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoInHdr {
++    pub status: u8,
++}
++
++#[repr(C)]
++#[derive(Debug, Pod, Clone, Copy)]
++pub struct VirtioCryptoDataStatus {
++    pub status: u8,
++}
++
++#[cfg(test)]
++mod tests {
++    use core::mem::{align_of, size_of};
++
++    use super::*;
++
++    #[test]
++    fn crypto_wire_layout() {
++        assert_eq!(size_of::<VirtioCryptoOpHeader>(), 24);
++        assert_eq!(align_of::<VirtioCryptoOpHeader>(), 8);
++        assert_eq!(size_of::<VirtioCryptoCtrlHeader>(), 16);
++        assert_eq!(size_of::<VirtioCryptoSessionInput>(), 16);
++        assert_eq!(size_of::<VirtioCryptoCreateSessionReq>(), 72);
++        assert_eq!(size_of::<VirtioCryptoDestroySessionReq>(), 72);
++        assert_eq!(size_of::<VirtioCryptoCipherDataReq>(), 72);
++    }
++}
+diff --git a/kernel/comps/virtio/src/device/mod.rs b/kernel/comps/virtio/src/device/mod.rs
+index 4679983b5..248babe47 100644
+--- a/kernel/comps/virtio/src/device/mod.rs
++++ b/kernel/comps/virtio/src/device/mod.rs
+@@ -6,6 +6,7 @@ use crate::queue::QueueError;
+ 
+ pub mod block;
+ pub mod console;
++pub mod crypto;
+ pub mod filesystem;
+ pub mod input;
+ pub mod network;
+diff --git a/kernel/comps/virtio/src/device/transport9p/device/client.rs b/kernel/comps/virtio/src/device/transport9p/device/client.rs
+index 17863d416..6fb8903ae 100644
+--- a/kernel/comps/virtio/src/device/transport9p/device/client.rs
++++ b/kernel/comps/virtio/src/device/transport9p/device/client.rs
+@@ -4,15 +4,6 @@
+ 
+ use super::*;
+ 
+-/// Directory entry returned by p9_readdir.
+-#[derive(Debug, Clone)]
+-pub struct P9DirEntryResult {
+-    pub qid: P9Qid,
+-    pub offset: u64,
+-    pub type_: u8,
+-    pub name: String,
+-}
+-
+ impl Transport9PDevice {
+     /// Tversion/Rversion — negotiate protocol version and msize.
+     pub(crate) fn p9_version(&self) -> Result<(), VirtioDeviceError> {
+@@ -32,8 +23,8 @@ impl Transport9PDevice {
+         let negotiated_msize = cmp::min(msize, server_msize);
+         self.msize.store(negotiated_msize, Ordering::Relaxed);
+ 
+-        let (version, _) = decode_string(&resp_body[4..])
+-            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let (version, _) =
++            decode_string(&resp_body[4..]).ok_or(VirtioDeviceError::QueueUnknownError)?;
+ 
+         info!(
+             "{} version negotiated: version={}, msize={}",
+@@ -66,8 +57,7 @@ impl Transport9PDevice {
+         let response = self.send_9p_request(&request, msize)?;
+         let resp_body = Self::check_9p_response(&response, P9_RATTACH)?;
+ 
+-        let (qid, _) = P9Qid::decode(resp_body)
+-            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let (qid, _) = P9Qid::decode(resp_body).ok_or(VirtioDeviceError::QueueUnknownError)?;
+ 
+         Ok(qid)
+     }
+@@ -101,8 +91,8 @@ impl Transport9PDevice {
+         let mut qids = Vec::with_capacity(nwqid);
+         let mut pos = 2;
+         for _ in 0..nwqid {
+-            let (qid, consumed) = P9Qid::decode(&resp_body[pos..])
+-                .ok_or(VirtioDeviceError::QueueUnknownError)?;
++            let (qid, consumed) =
++                P9Qid::decode(&resp_body[pos..]).ok_or(VirtioDeviceError::QueueUnknownError)?;
+             qids.push(qid);
+             pos += consumed;
+         }
+@@ -111,11 +101,7 @@ impl Transport9PDevice {
+     }
+ 
+     /// Tlopen/Rlopen — open a file by fid, returning (qid, iounit).
+-    pub fn p9_lopen(
+-        &self,
+-        fid: u32,
+-        flags: u32,
+-    ) -> Result<(P9Qid, u32), VirtioDeviceError> {
++    pub fn p9_lopen(&self, fid: u32, flags: u32) -> Result<(P9Qid, u32), VirtioDeviceError> {
+         let mut body = Vec::new();
+         body.extend_from_slice(&fid.to_le_bytes());
+         body.extend_from_slice(&flags.to_le_bytes());
+@@ -129,8 +115,7 @@ impl Transport9PDevice {
+         if resp_body.len() < 17 {
+             return Err(VirtioDeviceError::QueueUnknownError);
+         }
+-        let (qid, _) = P9Qid::decode(resp_body)
+-            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let (qid, _) = P9Qid::decode(resp_body).ok_or(VirtioDeviceError::QueueUnknownError)?;
+         let iounit = read_u32_le(resp_body, 13);
+ 
+         Ok((qid, iounit))
+@@ -161,19 +146,14 @@ impl Transport9PDevice {
+         if resp_body.len() < 17 {
+             return Err(VirtioDeviceError::QueueUnknownError);
+         }
+-        let (qid, _) = P9Qid::decode(resp_body)
+-            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let (qid, _) = P9Qid::decode(resp_body).ok_or(VirtioDeviceError::QueueUnknownError)?;
+         let iounit = read_u32_le(resp_body, 13);
+ 
+         Ok((qid, iounit))
+     }
+ 
+     /// Tgetattr/Rgetattr.
+-    pub fn p9_getattr(
+-        &self,
+-        fid: u32,
+-        request_mask: u64,
+-    ) -> Result<P9Attr, VirtioDeviceError> {
++    pub fn p9_getattr(&self, fid: u32, request_mask: u64) -> Result<P9Attr, VirtioDeviceError> {
+         let mut body = Vec::new();
+         body.extend_from_slice(&fid.to_le_bytes());
+         body.extend_from_slice(&request_mask.to_le_bytes());
+@@ -184,8 +164,7 @@ impl Transport9PDevice {
+         let response = self.send_9p_request(&request, msize)?;
+         let resp_body = Self::check_9p_response(&response, P9_RGETATTR)?;
+ 
+-        let (attr, _) = P9Attr::decode(resp_body)
+-            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let (attr, _) = P9Attr::decode(resp_body).ok_or(VirtioDeviceError::QueueUnknownError)?;
+ 
+         Ok(attr)
+     }
+@@ -226,12 +205,7 @@ impl Transport9PDevice {
+     }
+ 
+     /// Tread/Rread — read data from an open fid.
+-    pub fn p9_read(
+-        &self,
+-        fid: u32,
+-        offset: u64,
+-        count: u32,
+-    ) -> Result<Vec<u8>, VirtioDeviceError> {
++    pub fn p9_read(&self, fid: u32, offset: u64, count: u32) -> Result<Vec<u8>, VirtioDeviceError> {
+         let mut body = Vec::new();
+         body.extend_from_slice(&fid.to_le_bytes());
+         body.extend_from_slice(&offset.to_le_bytes());
+@@ -255,12 +229,7 @@ impl Transport9PDevice {
+     }
+ 
+     /// Twrite/Rwrite — write data to an open fid, returns bytes written.
+-    pub fn p9_write(
+-        &self,
+-        fid: u32,
+-        offset: u64,
+-        data: &[u8],
+-    ) -> Result<u32, VirtioDeviceError> {
++    pub fn p9_write(&self, fid: u32, offset: u64, data: &[u8]) -> Result<u32, VirtioDeviceError> {
+         let mut body = Vec::new();
+         body.extend_from_slice(&fid.to_le_bytes());
+         body.extend_from_slice(&offset.to_le_bytes());
+@@ -346,8 +315,7 @@ impl Transport9PDevice {
+         let response = self.send_9p_request(&request, msize)?;
+         let resp_body = Self::check_9p_response(&response, P9_RMKDIR)?;
+ 
+-        let (qid, _) = P9Qid::decode(resp_body)
+-            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let (qid, _) = P9Qid::decode(resp_body).ok_or(VirtioDeviceError::QueueUnknownError)?;
+ 
+         Ok(qid)
+     }
+@@ -397,12 +365,7 @@ impl Transport9PDevice {
+     }
+ 
+     /// Tlink/Rlink — create a hard link.
+-    pub fn p9_link(
+-        &self,
+-        dfid: u32,
+-        fid: u32,
+-        name: &str,
+-    ) -> Result<(), VirtioDeviceError> {
++    pub fn p9_link(&self, dfid: u32, fid: u32, name: &str) -> Result<(), VirtioDeviceError> {
+         let mut body = Vec::new();
+         body.extend_from_slice(&dfid.to_le_bytes());
+         body.extend_from_slice(&fid.to_le_bytes());
+@@ -437,8 +400,7 @@ impl Transport9PDevice {
+         let response = self.send_9p_request(&request, msize)?;
+         let resp_body = Self::check_9p_response(&response, P9_RSYMLINK)?;
+ 
+-        let (qid, _) = P9Qid::decode(resp_body)
+-            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let (qid, _) = P9Qid::decode(resp_body).ok_or(VirtioDeviceError::QueueUnknownError)?;
+ 
+         Ok(qid)
+     }
+@@ -454,8 +416,7 @@ impl Transport9PDevice {
+         let response = self.send_9p_request(&request, msize)?;
+         let resp_body = Self::check_9p_response(&response, P9_RREADLINK)?;
+ 
+-        let (target, _) = decode_string(resp_body)
+-            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let (target, _) = decode_string(resp_body).ok_or(VirtioDeviceError::QueueUnknownError)?;
+ 
+         Ok(target)
+     }
+@@ -484,8 +445,7 @@ impl Transport9PDevice {
+         let response = self.send_9p_request(&request, msize)?;
+         let resp_body = Self::check_9p_response(&response, P9_RMKNOD)?;
+ 
+-        let (qid, _) = P9Qid::decode(resp_body)
+-            .ok_or(VirtioDeviceError::QueueUnknownError)?;
++        let (qid, _) = P9Qid::decode(resp_body).ok_or(VirtioDeviceError::QueueUnknownError)?;
+ 
+         Ok(qid)
+     }
+diff --git a/kernel/comps/virtio/src/lib.rs b/kernel/comps/virtio/src/lib.rs
+index 4d3a9ea6c..64ed1c2d3 100644
+--- a/kernel/comps/virtio/src/lib.rs
++++ b/kernel/comps/virtio/src/lib.rs
+@@ -20,6 +20,7 @@ use device::{
+     VirtioDeviceType,
+     block::device::BlockDevice,
+     console::device::ConsoleDevice,
++    crypto::device::CryptoDevice,
+     filesystem::device::FileSystemDevice,
+     input::device::InputDevice,
+     network::device::NetworkDevice,
+@@ -80,6 +81,7 @@ fn virtio_component_init() -> Result<(), ComponentInitError> {
+             VirtioDeviceType::Socket => SocketDevice::init(transport),
+             VirtioDeviceType::FileSystem => FileSystemDevice::init(transport),
+             VirtioDeviceType::Transport9P => Transport9PDevice::init(transport),
++            VirtioDeviceType::Crypto => CryptoDevice::init(transport),
+             _ => {
+                 warn!("[Virtio]: Found unimplemented device:{:?}", device_type);
+                 Ok(())
+@@ -121,6 +123,7 @@ fn negotiate_features(transport: &mut Box<dyn VirtioTransport>) {
+         VirtioDeviceType::Transport9P => {
+             Transport9PDevice::negotiate_features(device_specified_features)
+         }
++        VirtioDeviceType::Crypto => CryptoDevice::negotiate_features(device_specified_features),
+         _ => device_specified_features,
+     };
+     let mut support_feature = Feature::from_bits_truncate(features);
+diff --git a/kernel/src/crypto/mod.rs b/kernel/src/crypto/mod.rs
+new file mode 100644
+index 000000000..567de5793
+--- /dev/null
++++ b/kernel/src/crypto/mod.rs
+@@ -0,0 +1,3 @@
++// SPDX-License-Identifier: MPL-2.0
++
++pub mod virtio;
+diff --git a/kernel/src/crypto/virtio.rs b/kernel/src/crypto/virtio.rs
+new file mode 100644
+index 000000000..1d899aa38
+--- /dev/null
++++ b/kernel/src/crypto/virtio.rs
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#![allow(dead_code)]
++
++use alloc::sync::Arc;
++
++use aster_virtio::device::crypto::device::{CryptoDevice, get_default_device};
++
++use crate::{
++    error::Errno,
++    prelude::{Error, Result},
++};
++
++pub struct VirtioCrypto {
++    device: Arc<CryptoDevice>,
++}
++
++impl VirtioCrypto {
++    pub fn new_default() -> Result<Self> {
++        let device = get_default_device()
++            .ok_or_else(|| Error::with_message(Errno::ENODEV, "virtio-crypto device not found"))?;
++        Ok(Self { device })
++    }
++
++    pub fn open_cipher_session(&self, algo: u32, key: &[u8], iv_len: u32) -> Result<CryptoSession> {
++        let enc_session_id = self
++            .device
++            .create_cipher_session(
++                algo,
++                key,
++                iv_len,
++                aster_virtio::device::crypto::protocol::VIRTIO_CRYPTO_OP_ENCRYPT,
++            )
++            .map_err(Error::from)?;
++
++        let dec_session_id = self
++            .device
++            .create_cipher_session(
++                algo,
++                key,
++                iv_len,
++                aster_virtio::device::crypto::protocol::VIRTIO_CRYPTO_OP_DECRYPT,
++            )
++            .map_err(Error::from)?;
++
++        Ok(CryptoSession {
++            device: self.device.clone(),
++            algo,
++            enc_session_id,
++            dec_session_id,
++        })
++    }
++}
++
++pub struct CryptoSession {
++    device: Arc<CryptoDevice>,
++    algo: u32,
++    enc_session_id: u64,
++    dec_session_id: u64,
++}
++
++impl CryptoSession {
++    pub fn session_id(&self) -> u64 {
++        self.enc_session_id
++    }
++
++    pub fn encrypt(&self, iv: &[u8], plaintext: &[u8]) -> Result<alloc::vec::Vec<u8>> {
++        self.device
++            .encrypt(self.algo, self.enc_session_id, iv, plaintext)
++            .map_err(Error::from)
++    }
++
++    pub fn decrypt(&self, iv: &[u8], ciphertext: &[u8]) -> Result<alloc::vec::Vec<u8>> {
++        self.device
++            .decrypt(self.algo, self.dec_session_id, iv, ciphertext)
++            .map_err(Error::from)
++    }
++
++    pub fn close(self) -> Result<()> {
++        self.device
++            .close_cipher_session(self.algo, self.enc_session_id)
++            .map_err(Error::from)?;
++        self.device
++            .close_cipher_session(self.algo, self.dec_session_id)
++            .map_err(Error::from)
++    }
++}
+diff --git a/kernel/src/device/misc/crypto.rs b/kernel/src/device/misc/crypto.rs
+new file mode 100644
+index 000000000..4f5075eac
+--- /dev/null
++++ b/kernel/src/device/misc/crypto.rs
+@@ -0,0 +1,433 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use alloc::sync::Arc;
++
++use device_id::{DeviceId, MinorId};
++use ostd::{mm::VmIo, task::Task};
++
++use super::MISC_MAJOR;
++use crate::{
++    crypto::virtio::{CryptoSession, VirtioCrypto},
++    fs::{
++        device::{Device, DeviceType},
++        file_table::{FdFlags, FileDesc},
++        inode_handle::FileIo,
++        path::FsPath,
++        utils::{AccessMode, InodeIo, OpenArgs, StatusFlags, mkmod},
++    },
++    prelude::*,
++    process::{
++        posix_thread::AsThreadLocal,
++        signal::{PollHandle, Pollable},
++    },
++    util::ioctl::{RawIoctl, dispatch_ioctl},
++};
++
++const CRYPTO_MINOR: u32 = 70;
++const CRYPTO_NULL: u32 = 16;
++const CRYPTO_AES_CBC: u32 = 11;
++const COP_ENCRYPT: u16 = 0;
++const COP_DECRYPT: u16 = 1;
++const COP_FLAG_NONE: u16 = 0;
++
++const VIRTIO_CRYPTO_CIPHER_AES_CBC: u32 = 3;
++const AES_BLOCK_SIZE: usize = 16;
++
++#[derive(Debug)]
++pub struct CryptoDevice {
++    id: DeviceId,
++}
++
++impl CryptoDevice {
++    pub fn new() -> Arc<Self> {
++        let major = MISC_MAJOR.get().unwrap().get();
++        let minor = MinorId::new(CRYPTO_MINOR);
++        let id = DeviceId::new(major, minor);
++        Arc::new(Self { id })
++    }
++}
++
++impl Device for CryptoDevice {
++    fn type_(&self) -> DeviceType {
++        DeviceType::Char
++    }
++
++    fn id(&self) -> DeviceId {
++        self.id
++    }
++
++    fn devtmpfs_path(&self) -> Option<String> {
++        Some("crypto".into())
++    }
++
++    fn open(&self) -> Result<Box<dyn FileIo>> {
++        Ok(Box::new(CryptoFile {
++            next_ses: Mutex::new(1),
++            sessions: Mutex::new(BTreeMap::new()),
++        }))
++    }
++}
++
++struct SessionState {
++    cipher: u32,
++    iv_len: usize,
++    backend: CipherBackend,
++}
++
++enum CipherBackend {
++    Null,
++    Virtio(CryptoSession),
++}
++
++impl CipherBackend {
++    fn crypt(&self, op: u16, iv: &[u8], src: &[u8]) -> Result<Vec<u8>> {
++        match self {
++            Self::Null => Ok(src.to_vec()),
++            Self::Virtio(session) => match op {
++                COP_ENCRYPT => session.encrypt(iv, src),
++                COP_DECRYPT => session.decrypt(iv, src),
++                _ => return_errno_with_message!(Errno::EINVAL, "invalid crypt_op op"),
++            },
++        }
++    }
++
++    fn close(self) -> Result<()> {
++        match self {
++            Self::Null => Ok(()),
++            Self::Virtio(session) => session.close(),
++        }
++    }
++}
++
++struct CipherSpec {
++    virtio_algo: Option<u32>,
++    iv_len: usize,
++    min_key_len: usize,
++    max_key_len: usize,
++}
++
++fn cipher_spec(cipher: u32) -> Option<CipherSpec> {
++    match cipher {
++        CRYPTO_NULL => Some(CipherSpec {
++            virtio_algo: None,
++            iv_len: 0,
++            min_key_len: 0,
++            max_key_len: 0,
++        }),
++        CRYPTO_AES_CBC => Some(CipherSpec {
++            virtio_algo: Some(VIRTIO_CRYPTO_CIPHER_AES_CBC),
++            iv_len: AES_BLOCK_SIZE,
++            min_key_len: 16,
++            max_key_len: 32,
++        }),
++        _ => None,
++    }
++}
++
++fn fill_cipher_info(cipher: u32, info: &mut SessionInfoOp) {
++    match cipher {
++        CRYPTO_NULL => {
++            fill_cstr(&mut info.cipher_info.cra_name, b"ecb(cipher_null)");
++            fill_cstr(&mut info.cipher_info.cra_driver_name, b"cryptodev-null");
++        }
++        CRYPTO_AES_CBC => {
++            fill_cstr(&mut info.cipher_info.cra_name, b"cbc(aes)");
++            fill_cstr(
++                &mut info.cipher_info.cra_driver_name,
++                b"virtio-crypto-aes-cbc",
++            );
++        }
++        _ => {
++            fill_cstr(&mut info.cipher_info.cra_name, b"unknown");
++            fill_cstr(&mut info.cipher_info.cra_driver_name, b"unknown");
++        }
++    }
++}
++
++struct CryptoFile {
++    next_ses: Mutex<u32>,
++    sessions: Mutex<BTreeMap<u32, SessionState>>,
++}
++
++impl Pollable for CryptoFile {
++    fn poll(
++        &self,
++        mask: crate::events::IoEvents,
++        _poller: Option<&mut PollHandle>,
++    ) -> crate::events::IoEvents {
++        let events = crate::events::IoEvents::IN | crate::events::IoEvents::OUT;
++        events & mask
++    }
++}
++
++impl InodeIo for CryptoFile {
++    fn read_at(
++        &self,
++        _offset: usize,
++        _writer: &mut VmWriter,
++        _status_flags: StatusFlags,
++    ) -> Result<usize> {
++        return_errno_with_message!(Errno::EINVAL, "read is not supported on /dev/crypto")
++    }
++
++    fn write_at(
++        &self,
++        _offset: usize,
++        _reader: &mut VmReader,
++        _status_flags: StatusFlags,
++    ) -> Result<usize> {
++        return_errno_with_message!(Errno::EINVAL, "write is not supported on /dev/crypto")
++    }
++}
++
++impl FileIo for CryptoFile {
++    fn check_seekable(&self) -> Result<()> {
++        return_errno_with_message!(Errno::ESPIPE, "seek is not supported")
++    }
++
++    fn is_offset_aware(&self) -> bool {
++        false
++    }
++
++    fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
++        use ioctl_defs::*;
++
++        dispatch_ioctl!(match raw_ioctl {
++            cmd @ CrioGet => {
++                let new_fd = self.clone_fd()?;
++                cmd.write(&(new_fd as u32))?;
++                Ok(0)
++            }
++            cmd @ CiocgSession => {
++                cmd.with_data_ptr(|data_ptr| {
++                    let mut op = data_ptr.read()?;
++                    let ses = self.create_session(&op)?;
++                    op.ses = ses;
++                    data_ptr.write(&op)?;
++                    Ok(0)
++                })
++            }
++            cmd @ CiocfSession => {
++                let ses = cmd.read()?;
++                self.close_session(ses)?;
++                Ok(0)
++            }
++            cmd @ CiocCrypt => {
++                cmd.with_data_ptr(|data_ptr| {
++                    let op = data_ptr.read()?;
++                    self.crypt(&op)?;
++                    Ok(0)
++                })
++            }
++            cmd @ CiocgSessInfo => {
++                cmd.with_data_ptr(|data_ptr| {
++                    let mut info = data_ptr.read()?;
++                    self.fill_sess_info(&mut info)?;
++                    data_ptr.write(&info)?;
++                    Ok(0)
++                })
++            }
++            _ => return_errno_with_message!(Errno::ENOTTY, "the ioctl command is unknown"),
++        })
++    }
++}
++
++impl CryptoFile {
++    fn clone_fd(&self) -> Result<FileDesc> {
++        let task =
++            Task::current().ok_or_else(|| Error::with_message(Errno::ESRCH, "no current task"))?;
++        let thread_local = AsThreadLocal::as_thread_local(&task)
++            .ok_or_else(|| Error::with_message(Errno::ESRCH, "no current thread local"))?;
++
++        let path = {
++            let fs = thread_local.borrow_fs();
++            let resolver = fs.resolver().read();
++            resolver.lookup(&FsPath::try_from("/dev/crypto")?)?
++        };
++
++        let open_args = OpenArgs::from_modes(AccessMode::O_RDWR, mkmod!(a+rw));
++        let file = Arc::new(path.open(open_args)?);
++
++        let mut file_table_ref = thread_local.borrow_file_table_mut();
++        let mut file_table = file_table_ref.unwrap().write();
++        Ok(file_table.insert(file, FdFlags::empty()))
++    }
++
++    fn create_session(&self, op: &SessionOp) -> Result<u32> {
++        let spec = cipher_spec(op.cipher)
++            .ok_or_else(|| Error::with_message(Errno::EOPNOTSUPP, "cipher is not supported"))?;
++
++        let keylen = op.keylen as usize;
++        if keylen < spec.min_key_len || keylen > spec.max_key_len {
++            return_errno_with_message!(Errno::EINVAL, "invalid key length for selected cipher");
++        }
++
++        let backend = if let Some(virtio_algo) = spec.virtio_algo {
++            if op.key == 0 {
++                return_errno_with_message!(
++                    Errno::EINVAL,
++                    "invalid key pointer for selected cipher"
++                );
++            }
++
++            let mut key = vec![0u8; keylen];
++            crate::current_userspace!().read_bytes(op.key, &mut key)?;
++
++            let crypto = VirtioCrypto::new_default()?;
++            let session = crypto.open_cipher_session(virtio_algo, &key, spec.iv_len as u32)?;
++            CipherBackend::Virtio(session)
++        } else {
++            CipherBackend::Null
++        };
++
++        let mut next = self.next_ses.lock();
++        let ses = *next;
++        *next = next.wrapping_add(1);
++        if *next == 0 {
++            *next = 1;
++        }
++
++        self.sessions.lock().insert(
++            ses,
++            SessionState {
++                cipher: op.cipher,
++                iv_len: spec.iv_len,
++                backend,
++            },
++        );
++
++        Ok(ses)
++    }
++
++    fn close_session(&self, ses: u32) -> Result<()> {
++        let state = self
++            .sessions
++            .lock()
++            .remove(&ses)
++            .ok_or_else(|| Error::with_message(Errno::ENOENT, "session not found"))?;
++        state.backend.close()?;
++        Ok(())
++    }
++
++    fn crypt(&self, op: &CryptOp) -> Result<()> {
++        let sessions = self.sessions.lock();
++        let state = sessions
++            .get(&op.ses)
++            .ok_or_else(|| Error::with_message(Errno::ENOENT, "session not found"))?;
++
++        if op.flags != COP_FLAG_NONE {
++            return_errno_with_message!(
++                Errno::EOPNOTSUPP,
++                "crypt_op flags are not supported currently"
++            );
++        }
++
++        if state.cipher == CRYPTO_AES_CBC && op.len as usize % AES_BLOCK_SIZE != 0 {
++            return_errno_with_message!(Errno::EINVAL, "AES-CBC length must be block aligned");
++        }
++
++        if op.src == 0 || op.dst == 0 {
++            return_errno_with_message!(Errno::EINVAL, "invalid crypt_op pointers");
++        }
++        if state.iv_len != 0 && op.iv == 0 {
++            return_errno_with_message!(Errno::EINVAL, "invalid IV pointer for selected cipher");
++        }
++
++        let mut src = vec![0u8; op.len as usize];
++        crate::current_userspace!().read_bytes(op.src, &mut src)?;
++
++        let mut iv = vec![0u8; state.iv_len];
++        if state.iv_len != 0 {
++            crate::current_userspace!().read_bytes(op.iv, &mut iv)?;
++        }
++
++        let out = state.backend.crypt(op.op, &iv, &src)?;
++
++        if !matches!(op.op, COP_ENCRYPT | COP_DECRYPT) {
++            return_errno_with_message!(Errno::EINVAL, "invalid crypt_op op");
++        };
++
++        if out.len() != src.len() {
++            return_errno_with_message!(Errno::EIO, "unexpected output length");
++        }
++
++        crate::current_userspace!().write_bytes(op.dst, &out)?;
++        Ok(())
++    }
++
++    fn fill_sess_info(&self, info: &mut SessionInfoOp) -> Result<()> {
++        let sessions = self.sessions.lock();
++        let state = sessions
++            .get(&info.ses)
++            .ok_or_else(|| Error::with_message(Errno::ENOENT, "session not found"))?;
++
++        fill_cipher_info(state.cipher, info);
++        info.alignmask = 0;
++        info.flags = 0;
++        Ok(())
++    }
++}
++
++fn fill_cstr(dst: &mut [u8], src: &[u8]) {
++    let copy_len = core::cmp::min(dst.len().saturating_sub(1), src.len());
++    dst[..copy_len].copy_from_slice(&src[..copy_len]);
++    dst[copy_len] = 0;
++}
++
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Pod)]
++struct SessionOp {
++    cipher: u32,
++    mac: u32,
++    keylen: u32,
++    _pad0: u32,
++    key: Vaddr,
++    mackeylen: u32,
++    _pad1: u32,
++    mackey: Vaddr,
++    ses: u32,
++    _pad2: u32,
++}
++
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Pod)]
++struct AlgInfo {
++    cra_name: [u8; 64],
++    cra_driver_name: [u8; 64],
++}
++
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Pod)]
++struct SessionInfoOp {
++    ses: u32,
++    cipher_info: AlgInfo,
++    hash_info: AlgInfo,
++    alignmask: u16,
++    _pad0: u16,
++    flags: u32,
++}
++
++#[repr(C)]
++#[derive(Debug, Clone, Copy, Pod)]
++struct CryptOp {
++    ses: u32,
++    op: u16,
++    flags: u16,
++    len: u32,
++    _pad0: u32,
++    src: Vaddr,
++    dst: Vaddr,
++    mac: Vaddr,
++    iv: Vaddr,
++}
++
++mod ioctl_defs {
++    use super::{CryptOp, SessionInfoOp, SessionOp};
++    use crate::util::ioctl::{InData, InOutData, ioc};
++
++    pub(super) type CrioGet = ioc!(CRIOGET, b'c', 101, InOutData<u32>);
++    pub(super) type CiocgSession = ioc!(CIOCGSESSION, b'c', 102, InOutData<SessionOp>);
++    pub(super) type CiocfSession = ioc!(CIOCFSESSION, b'c', 103, InData<u32>);
++    pub(super) type CiocCrypt = ioc!(CIOCCRYPT, b'c', 104, InOutData<CryptOp>);
++    pub(super) type CiocgSessInfo = ioc!(CIOCGSESSINFO, b'c', 107, InOutData<SessionInfoOp>);
++}
+diff --git a/kernel/src/device/misc/mod.rs b/kernel/src/device/misc/mod.rs
+index 61328c2ff..43814c773 100644
+--- a/kernel/src/device/misc/mod.rs
++++ b/kernel/src/device/misc/mod.rs
+@@ -11,12 +11,15 @@ use super::registry::char::{MajorIdOwner, acquire_major};
+ 
+ #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
+ pub mod tdxguest;
++pub mod crypto;
+ 
+ static MISC_MAJOR: Once<MajorIdOwner> = Once::new();
+ 
+ pub(super) fn init_in_first_kthread() {
+     MISC_MAJOR.call_once(|| acquire_major(MajorId::new(10)).unwrap());
+ 
++    super::registry::char::register(crypto::CryptoDevice::new()).unwrap();
++
+     #[cfg(target_arch = "x86_64")]
+     ostd::if_tdx_enabled!({
+         super::registry::char::register(tdxguest::TdxGuest::new()).unwrap();
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index 5a98b5c27..eaf2ad0f7 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -35,6 +35,7 @@ extern crate ostd_pod;
+ mod arch;
+ 
+ mod context;
++pub mod crypto;
+ mod cpu;
+ mod device;
+ mod driver;
+diff --git a/tools/qemu_args.sh b/tools/qemu_args.sh
+index bbec08f08..1fc7e7737 100755
+--- a/tools/qemu_args.sh
++++ b/tools/qemu_args.sh
+@@ -21,6 +21,9 @@
+ #  - ENABLE_VIRTIOFS: "0" or "1" to enable vhost-user virtio-fs device;
+ #  - VIRTIOFS_TAG: mount tag for virtio-fs device;
+ #  - VIRTIOFS_SOCKET: vhost-user socket path for virtio-fs backend.
++#  - ENABLE_VIRTIO_CRYPTO: "0" or "1" to enable virtio-crypto device;
++#  - VIRTIO_CRYPTO_QUEUES: number of virtio-crypto data queues;
++#  - VIRTIO_CRYPTO_QUEUE_SIZE: virtio-crypto queue size;
+ 
+ OVMF=${OVMF:-"on"}
+ VHOST=${VHOST:-"off"}
+@@ -33,6 +36,7 @@ VIRTIO9P_SHARED_DIR=${VIRTIO9P_SHARED_DIR:-"/tmp/9p_shared"}
+ ENABLE_VIRTIOFS=${ENABLE_VIRTIOFS:-"0"}
+ VIRTIOFS_TAG=${VIRTIOFS_TAG:-"myfs"}
+ VIRTIOFS_SOCKET=${VIRTIOFS_SOCKET:-"/tmp/vhostqemu/vfs.sock"}
++ENABLE_VIRTIO_CRYPTO=${ENABLE_VIRTIO_CRYPTO:-"0"}
+ 
+ SSH_RAND_PORT=${SSH_PORT:-$(shuf -i 1024-65535 -n 1)}
+ NGINX_RAND_PORT=${NGINX_PORT:-$(shuf -i 1024-65535 -n 1)}
+@@ -196,6 +200,23 @@ if [ "$VSOCK" = "on" ]; then
+     fi
+ fi
+ 
++if [ "$ENABLE_VIRTIO_CRYPTO" = "1" ]; then
++    echo "[$1] Enabled virtio-crypto" 1>&2
++    if [ "$1" = "microvm" ]; then
++        MICROVM_QEMU_ARGS="
++            $MICROVM_QEMU_ARGS \
++            -object cryptodev-backend-builtin,id=cryptobuiltin0 \
++            -device virtio-crypto-device,id=virtio-crypto0,cryptodev=cryptobuiltin0 \
++        "
++    else
++        QEMU_ARGS="
++            $QEMU_ARGS \
++            -object cryptodev-backend-builtin,id=cryptobuiltin0 \
++            -device virtio-crypto-pci,id=virtio-crypto0,cryptodev=cryptobuiltin0 \
++        "
++    fi
++fi
++
+ 
+ if [ "$1" = "microvm" ]; then
+     QEMU_ARGS=$MICROVM_QEMU_ARGS
