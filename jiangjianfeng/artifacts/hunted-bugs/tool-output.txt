@@ -1,0 +1,47 @@
+Analyzed 24 crate(s), collected 25398 MIR-backed function(s), 3364 lock event(s), and 1021 lock edge(s).
+Detected 3 potential lock cycle(s) in the global dependency graph.
+Detected 75 atomic-mode violation(s).
+Detected 0 single-lock IRQ safety violation(s) and 0 IRQ dependency violation(s).
+Detected 1 potential AA/self-loop deadlock(s).
+Loaded config from /root/asterinas-codex/lockdep.toml (ignore=0, irq_entries=1, ordered_helpers=0).
+- aster-bigtcp (aster_bigtcp) : 412 function(s), 122 event(s), 23 edge(s)
+- aster-block (aster_block) : 344 function(s), 34 event(s), 0 edge(s)
+- aster-cmdline (aster_cmdline) : 97 function(s), 0 event(s), 0 edge(s)
+- aster-console (aster_console) : 92 function(s), 5 event(s), 0 edge(s)
+- aster-framebuffer (aster_framebuffer) : 97 function(s), 20 event(s), 0 edge(s)
+- aster-i8042 (aster_i8042) : 283 function(s), 13 event(s), 0 edge(s)
+- aster-input (aster_input) : 202 function(s), 26 event(s), 3 edge(s)
+- aster-kernel (aster_kernel) : 15889 function(s), 2523 event(s), 809 edge(s)
+- aster-logger (aster_logger) : 10 function(s), 0 event(s), 0 edge(s)
+- aster-mlsdisk (aster_mlsdisk) : 1605 function(s), 299 event(s), 162 edge(s)
+- aster-network (aster_network) : 76 function(s), 46 event(s), 11 edge(s)
+- aster-pci (aster_pci) : 234 function(s), 6 event(s), 4 edge(s)
+- aster-softirq (aster_softirq) : 49 function(s), 2 event(s), 0 edge(s)
+- aster-systree (aster_systree) : 291 function(s), 17 event(s), 0 edge(s)
+- aster-time (aster_time) : 202 function(s), 8 event(s), 0 edge(s)
+- aster-uart (aster_uart) : 19 function(s), 11 event(s), 0 edge(s)
+- aster-util (aster_util) : 159 function(s), 0 event(s), 0 edge(s)
+- aster-virtio (aster_virtio) : 1851 function(s), 87 event(s), 6 edge(s)
+- device-id (device_id) : 15 function(s), 0 event(s), 0 edge(s)
+- osdk-frame-allocator (osdk_frame_allocator) : 59 function(s), 1 event(s), 0 edge(s)
+- osdk-heap-allocator (osdk_heap_allocator) : 35 function(s), 10 event(s), 0 edge(s)
+- osdk-test-kernel (osdk_test_kernel) : 56 function(s), 0 event(s), 0 edge(s)
+- ostd (ostd) : 3213 function(s), 132 event(s), 3 edge(s)
+- xarray (xarray) : 108 function(s), 2 event(s), 0 edge(s)
+- cycle 1: Mutex(lock) -> RwMutex(write) -> Mutex(lock)
+  Mutex(lock) -> RwMutex(write) via fs::fs_impls::exfat::inode::ExfatInode::reclaim_space [Task] at kernel/src/fs/fs_impls/exfat/inode.rs:816:9
+  RwMutex(write) -> Mutex(lock) via fs::fs_impls::exfat::inode::ExfatInode::reclaim_space [Task] at kernel/src/fs/fs_impls/exfat/inode.rs:815:24
+- cycle 2: RwMutex(write) -> RwMutex(write) -> RwMutex(write)
+  RwMutex(write) -> RwMutex(write) via fs::fs_impls::ext2::inode::write_lock_two_inodes [Task] at kernel/src/fs/fs_impls/ext2/inode.rs:953:20
+  RwMutex(write) -> RwMutex(write) via fs::fs_impls::ext2::inode::write_lock_two_inodes [Task] at kernel/src/fs/fs_impls/ext2/inode.rs:949:21
+- cycle 3: SpinLock(lock) -> SpinLock(lock) -> SpinLock(lock)
+  SpinLock(lock) -> SpinLock(lock) via process::posix_thread::futex::lock_bucket_pairs [Task] at kernel/src/process/posix_thread/futex.rs:382:28
+  SpinLock(lock) -> SpinLock(lock) via process::posix_thread::futex::lock_bucket_pairs [Task] at kernel/src/process/posix_thread/futex.rs:377:28
+- atomic mode violation 1: RwLock(read) -> Mutex(lock)
+  witness: <net::socket::vsock::stream::socket::VsockStreamSocket as net::socket::Socket>::addr [Task] at kernel/src/net/socket/vsock/stream/socket.rs:293:35
+- atomic mode violation 2: RwLock(read) -> Mutex(lock)
+  witness: <net::socket::vsock::stream::socket::VsockStreamSocket as net::socket::Socket>::bind [Task] at kernel/src/net/socket/vsock/stream/socket.rs:146:35
+- atomic mode violation 3: SpinLock(lock) -> RwMutex(read)
+  witness: net::socket::unix::datagram::message::MessageReceiver::bind [Task] at kernel/src/net/socket/unix/datagram/message.rs:159:26
+- aa deadlock 1: self_lock RwMutex(self(method=fs::fs_impls::exfat::inode::ExfatInode::reclaim_space,ty=fs::fs_impls::exfat::inode::ExfatInode)->*<fs::fs_impls::exfat::inode::ExfatInode>->fs::fs_impls::exfat::inode::ExfatInode::inner#0)
+  fs::fs_impls::exfat::inode::ExfatInode::reclaim_space [Task write] at kernel/src/fs/fs_impls/exfat/inode.rs:816:9
